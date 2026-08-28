@@ -22,17 +22,23 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = config("SECRET_KEY", default='')
+SECRET_KEY = config("SECRET_KEY", default="django-insecure-demo-only-change-me")
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = config("DEBUG", default=True)
+DEBUG_VALUE = str(config("DEBUG", default="true")).strip().lower()
+DEBUG = DEBUG_VALUE in {"1", "true", "yes", "on", "development", "dev"}
 
-ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='').split(',')
+ALLOWED_HOSTS = [host.strip() for host in config('ALLOWED_HOSTS', default='*').split(',') if host.strip()]
 
-if 'CODESPACE_NAME' in os.environ:
-    codespace_name = config("CODESPACE_NAME")
-    codespace_domain = config("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN")
-    CSRF_TRUSTED_ORIGINS = [f'https://{codespace_name}-8000.{codespace_domain}']
+# CSRF valida a origem do navegador separadamente de ALLOWED_HOSTS. O preview
+# local do Codespaces costuma usar https://localhost:8000, enquanto o preview
+# público usa o domínio encaminhado da porta 8000.
+configured_csrf_origins = [origin.strip() for origin in config("CSRF_TRUSTED_ORIGINS", default="").split(",") if origin.strip()]
+CSRF_TRUSTED_ORIGINS = ["https://localhost:8000", "http://localhost:8000", *configured_csrf_origins]
+codespace_name = os.environ.get("CODESPACE_NAME") or config("CODESPACE_NAME", default="")
+codespace_domain = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN") or config("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN", default="")
+if codespace_name and codespace_domain:
+    CSRF_TRUSTED_ORIGINS.append(f"https://{codespace_name}-8000.{codespace_domain}")
 
 # Application definition
 
@@ -44,6 +50,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "django_browser_reload",
+    "fleet",
 ]
 
 MIDDLEWARE = [
@@ -83,12 +90,20 @@ WSGI_APPLICATION = "hello_world.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+DB_ENGINE = config("DB_ENGINE", default="django.db.backends.sqlite3")
+if DB_ENGINE == "django.db.backends.sqlite3":
+    DATABASES = {"default": {"ENGINE": DB_ENGINE, "NAME": BASE_DIR / config("DB_NAME", default="db.sqlite3")}}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": DB_ENGINE,
+            "NAME": config("DB_DATABASE", default="frota"),
+            "USER": config("DB_USERNAME", default=""),
+            "PASSWORD": config("DB_PASSWORD", default=""),
+            "HOST": config("DB_HOST", default="127.0.0.1"),
+            "PORT": config("DB_PORT", default="5432"),
+        }
     }
-}
 
 
 # Password validation
@@ -113,9 +128,9 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/5.0/topics/i18n/
 
-LANGUAGE_CODE = "en-us"
+LANGUAGE_CODE = "pt-br"
 
-TIME_ZONE = "UTC"
+TIME_ZONE = "America/Sao_Paulo"
 
 USE_I18N = True
 
@@ -140,3 +155,7 @@ MEDIA_ROOT = BASE_DIR / "hello_world" / "media"
 # https://docs.djangoproject.com/en/5.0/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+LOGIN_URL = "login"
+LOGIN_REDIRECT_URL = "home"
+LOGOUT_REDIRECT_URL = "login"

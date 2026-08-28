@@ -3,3 +3,6 @@ __pycache__/
 staticfiles/
 .env
 venv/
+.venv/
+media/
+*.sqlite3-journal

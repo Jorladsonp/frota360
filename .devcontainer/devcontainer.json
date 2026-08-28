@@ -7,12 +7,13 @@
   "updateContentCommand": "pip install -r requirements.txt && python manage.py migrate",
   "postCreateCommand": "cp .env.example .env",
   "postAttachCommand": {
-    "server": "python manage.py runserver"
+    "server": "python manage.py runserver 0.0.0.0:8000"
   },
   "customizations": {
     "codespaces": {
       "openFiles": [
-        "hello_world/templates/index.html"
+        "README.md",
+        "fleet/templates/registration/login.html"
       ]
     },
     "vscode": {
