@@ -70,6 +70,44 @@ class AuthenticationAndTenantTests(FleetTestCase):
         self.assertIn('const chartData={"labels"', page)
         self.assertIn('const breakdownData={"truck_labels"', page)
 
+    def test_dashboard_prioritizes_alerts_and_uses_operational_health_status(self):
+        response = self.login(self.manager_user).get(reverse("dashboard"))
+        page = response.content.decode()
+        self.assertLess(page.index("attention-panel"), page.index("filter-bar"))
+        self.assertContains(response, "Em operação")
+        self.assertContains(response, "Inativos")
+        self.assertContains(response, "Status da frota")
+        self.assertIn('data-sidebar-collapse', page)
+        self.assertIn('class="col-12"', page)
+
+    def test_financial_pages_render_interactive_chart_sections(self):
+        client = self.login(self.manager_user)
+        pages = (
+            ("production_list", "productionMonthlyChart"),
+            ("fixed_cost_list", "fixedCategoryChart"),
+            ("remuneration_view", "remunerationHistoryChart"),
+        )
+        for route_name, chart_id in pages:
+            response = client.get(reverse(route_name))
+            self.assertEqual(response.status_code, 200)
+            self.assertContains(response, chart_id)
+
+    def test_dashboard_and_reports_expose_chart_filter_dimensions(self):
+        client = self.login(self.manager_user)
+        dashboard = client.get(reverse("dashboard"))
+        dashboard_page = dashboard.content.decode()
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertIn('"starts":', dashboard_page)
+        self.assertIn('"truck_ids":', dashboard_page)
+        costs = client.get(reverse("report_view", args=["custos"]))
+        costs_page = costs.content.decode()
+        self.assertEqual(costs.status_code, 200)
+        self.assertIn('"keys":', costs_page)
+        self.assertIn('"ids":', costs_page)
+        result = client.get(reverse("report_view", args=["resultado"]))
+        self.assertEqual(result.status_code, 200)
+        self.assertIn('"starts":', result.content.decode())
+
     def test_manager_can_create_individual_driver_access(self):
         client = self.login(self.manager_user)
         response = client.post(reverse("driver_create"), {"name": "Novo Motorista", "access_username": "novo_motorista", "access_password": "SenhaForte!2026", "phone": "(00) 90000-0000", "status": Driver.ACTIVE, "monthly_fixed": "1800", "notes": ""})
@@ -174,3 +212,4 @@ class SeedCommandTests(TestCase):
             self.assertEqual(model.objects.count(), count)
         self.assertEqual(Truck.objects.filter(financial_status=Truck.FINANCED).count(), 3)
         self.assertEqual(Truck.objects.filter(financial_status=Truck.PAID).count(), 2)
+        self.assertGreater(Fueling.objects.filter(km_per_liter__isnull=False).count(), 0)

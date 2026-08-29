@@ -72,6 +72,12 @@ def parse_date(value, fallback):
         return fallback
 
 
+def shift_month(value, months):
+    """Move a date by whole calendar months while keeping it on day one."""
+    index = value.year * 12 + value.month - 1 + months
+    return date(index // 12, index % 12 + 1, 1)
+
+
 def filter_period(request):
     today = timezone.localdate()
     default_start = today.replace(day=1) - timedelta(days=150)
@@ -87,16 +93,19 @@ def dashboard_filter_context(request, company):
     selected_driver = request.GET.get("driver", "")
     selected_contract = request.GET.get("contract", "")
     selected_fuel_type = request.GET.get("fuel_type", "")
+    selected_fleet_status = request.GET.get("fleet_status", "")
     if selected_truck:
         trucks = trucks.filter(pk=selected_truck)
     if selected_driver:
         drivers = drivers.filter(pk=selected_driver)
     if selected_contract:
         contracts = contracts.filter(pk=selected_contract)
+    if selected_fleet_status in (Truck.OPERATING, Truck.MAINTENANCE, Truck.INACTIVE):
+        trucks = trucks.filter(status=selected_fleet_status)
     return {
         "start": start, "end": end, "trucks": Truck.objects.filter(company=company), "drivers": Driver.objects.filter(company=company),
         "contracts": Contract.objects.filter(company=company), "selected_truck": selected_truck, "selected_driver": selected_driver,
-        "selected_contract": selected_contract, "selected_fuel_type": selected_fuel_type, "fuel_types": Truck.FUEL_CHOICES, "city": request.GET.get("city", ""), "state": request.GET.get("state", ""),
+        "selected_contract": selected_contract, "selected_fuel_type": selected_fuel_type, "selected_fleet_status": selected_fleet_status, "fleet_statuses": Truck.STATUS_CHOICES, "fuel_types": Truck.FUEL_CHOICES, "city": request.GET.get("city", ""), "state": request.GET.get("state", ""),
     }, (trucks, drivers, contracts)
 
 
@@ -180,7 +189,14 @@ def monthly_chart_data(company, start, end, truck_ids=None, driver_ids=None, con
         result.append(float(metric["result"]))
         consumption.append(float(metric["avg_km_l"]))
         cursor = month_end + timedelta(days=1)
-    return {"labels": labels, "revenue": revenue, "costs": costs, "result": result, "consumption": consumption}
+    starts, ends = [], []
+    cursor = start.replace(day=1)
+    while cursor <= end:
+        month_end = cursor.replace(day=monthrange(cursor.year, cursor.month)[1])
+        starts.append(max(start, cursor).isoformat())
+        ends.append(min(end, month_end).isoformat())
+        cursor = month_end + timedelta(days=1)
+    return {"labels": labels, "revenue": revenue, "costs": costs, "result": result, "consumption": consumption, "starts": starts, "ends": ends}
 
 
 def breakdown_chart_data(company, start, end, truck_ids=None, driver_ids=None, contract_ids=None, city="", state="", fuel_type=""):
@@ -208,12 +224,12 @@ def breakdown_chart_data(company, start, end, truck_ids=None, driver_ids=None, c
         production = production.filter(contract_id__in=contract_ids)
     if truck_ids:
         production = production.filter(Q(truck_id__in=truck_ids) | Q(truck__isnull=True))
-    production_rows = list(production.values("contract__code").annotate(value=Sum("realized_value")).order_by("contract__code"))
+    production_rows = list(production.values("contract_id", "contract__code").annotate(value=Sum("realized_value")).order_by("contract__code"))
     remuneration = Remuneration.objects.filter(company=company, competence__range=(start, end))
     if driver_ids:
         remuneration = remuneration.filter(driver_id__in=driver_ids)
-    remuneration_rows = list(remuneration.values("driver__name").annotate(value=Sum("total_amount")).order_by("driver__name"))
-    return {"truck_labels": truck_labels, "result_values": result_values, "km_l_values": km_l_values, "maintenance_values": maintenance_values, "contract_labels": [row["contract__code"] for row in production_rows], "production_values": [float(row["value"] or 0) for row in production_rows], "driver_labels": [row["driver__name"] for row in remuneration_rows], "remuneration_values": [float(row["value"] or 0) for row in remuneration_rows]}
+    remuneration_rows = list(remuneration.values("driver_id", "driver__name").annotate(value=Sum("total_amount")).order_by("driver__name"))
+    return {"truck_labels": truck_labels, "truck_ids": list(trucks.values_list("pk", flat=True)), "result_values": result_values, "km_l_values": km_l_values, "maintenance_values": maintenance_values, "contract_labels": [row["contract__code"] for row in production_rows], "contract_ids": [row["contract_id"] for row in production_rows], "production_values": [float(row["value"] or 0) for row in production_rows], "driver_labels": [row["driver__name"] for row in remuneration_rows], "driver_ids": [row["driver_id"] for row in remuneration_rows], "remuneration_values": [float(row["value"] or 0) for row in remuneration_rows]}
 
 
 def home(request):
@@ -258,13 +274,16 @@ def dashboard(request):
         return render(request, "fleet/empty.html", {"title": "Empresa não configurada"})
     filters, selected = dashboard_filter_context(request, company)
     trucks, drivers, contracts = selected
-    truck_ids = list(trucks.values_list("id", flat=True)) if filters["selected_truck"] else None
+    truck_ids = list(trucks.values_list("id", flat=True)) if (filters["selected_truck"] or filters["selected_fleet_status"]) else None
     driver_ids = list(drivers.values_list("id", flat=True)) if filters["selected_driver"] else None
     contract_ids = list(contracts.values_list("id", flat=True)) if filters["selected_contract"] else None
     metric = dashboard_metrics(company, filters["start"], filters["end"], truck_ids, driver_ids, contract_ids, filters["city"], filters["state"], filters["selected_fuel_type"])
     all_trucks = Truck.objects.filter(company=company)
+    fleet_health_trucks = all_trucks
+    if filters["selected_fleet_status"] in (Truck.OPERATING, Truck.MAINTENANCE, Truck.INACTIVE):
+        fleet_health_trucks = fleet_health_trucks.filter(status=filters["selected_fleet_status"])
     repeated_maintenance = Maintenance.objects.filter(company=company, date__gte=filters["start"], date__lte=filters["end"]).values("truck_id", "maintenance_type").annotate(total=Count("id")).filter(total__gt=1).count()
-    context = {**filters, "company": company, "metrics": metric, "chart_data": json.dumps(monthly_chart_data(company, filters["start"], filters["end"], truck_ids, driver_ids, contract_ids, filters["city"], filters["state"], filters["selected_fuel_type"])), "breakdown_data": json.dumps(breakdown_chart_data(company, filters["start"], filters["end"], truck_ids, driver_ids, contract_ids, filters["city"], filters["state"], filters["selected_fuel_type"])), "financed_count": all_trucks.filter(financial_status=Truck.FINANCED).count(), "paid_count": all_trucks.filter(financial_status=Truck.PAID).count(), "maintenance_trucks": all_trucks.filter(status=Truck.MAINTENANCE).count(), "open_trips": Trip.objects.filter(company=company, status=Trip.IN_PROGRESS).count(), "alert_maintenance": Maintenance.objects.filter(company=company, next_date__lt=timezone.localdate(), status=Maintenance.DONE).count(), "high_cost_maintenance": Maintenance.objects.filter(company=company, date__range=(filters["start"], filters["end"]), amount__gte=5000).count(), "repeated_maintenance": repeated_maintenance, "recent_trips": Trip.objects.filter(company=company).select_related("truck", "driver", "contract")[:8]}
+    context = {**filters, "company": company, "metrics": metric, "chart_data": json.dumps(monthly_chart_data(company, filters["start"], filters["end"], truck_ids, driver_ids, contract_ids, filters["city"], filters["state"], filters["selected_fuel_type"])), "breakdown_data": json.dumps(breakdown_chart_data(company, filters["start"], filters["end"], truck_ids, driver_ids, contract_ids, filters["city"], filters["state"], filters["selected_fuel_type"])), "operating_trucks": fleet_health_trucks.filter(status=Truck.OPERATING).count(), "maintenance_trucks": fleet_health_trucks.filter(status=Truck.MAINTENANCE).count(), "inactive_trucks": fleet_health_trucks.filter(status=Truck.INACTIVE).count(), "fleet_total": fleet_health_trucks.count(), "open_trips": Trip.objects.filter(company=company, status=Trip.IN_PROGRESS).count(), "alert_maintenance": Maintenance.objects.filter(company=company, next_date__lt=timezone.localdate(), status=Maintenance.DONE).count(), "high_cost_maintenance": Maintenance.objects.filter(company=company, date__range=(filters["start"], filters["end"]), amount__gte=5000).count(), "repeated_maintenance": repeated_maintenance, "recent_trips": Trip.objects.filter(company=company).select_related("truck", "driver", "contract")[:8]}
     return render(request, "fleet/dashboard.html", context)
 
 
@@ -524,13 +543,28 @@ def tire_create(request):
 
 @manager_required
 def production_list(request):
-    company = current_company(request.user); queryset = Production.objects.filter(company=company).select_related("contract", "truck", "driver")
+    company = current_company(request.user)
     start, end = filter_period(request)
-    queryset = queryset.filter(competence__range=(start, end))
+    queryset = Production.objects.filter(company=company, competence__range=(start, end)).select_related("contract", "truck", "driver")
     for key in ("contract", "truck", "driver", "status"):
         if request.GET.get(key):
             queryset = queryset.filter(**{f"{key}_id" if key != "status" else key: request.GET[key]})
-    return render(request, "fleet/list.html", _list_context("Produção financeira", queryset, "production_create", columns=[("contract", "Contrato"), ("competence", "Competência"), ("realized_value", "Valor realizado"), ("truck", "Caminhão"), ("driver", "Motorista"), ("get_status_display", "Status")], production_filters=True, production_start=start, production_end=end, production_contracts=Contract.objects.filter(company=company), production_trucks=Truck.objects.filter(company=company), production_drivers=Driver.objects.filter(company=company), production_statuses=Production.STATUS_CHOICES))
+    status_labels = dict(Production.STATUS_CHOICES)
+    monthly_rows = list(queryset.values("competence__year", "competence__month").annotate(total=Sum("realized_value")).order_by("competence__year", "competence__month"))
+    status_rows = list(queryset.values("status").annotate(total=Sum("realized_value"), count=Count("id")).order_by("status"))
+    contract_rows = list(queryset.values("contract_id", "contract__code").annotate(total=Sum("realized_value")).order_by("-total"))
+    total = queryset.aggregate(total=Sum("realized_value"))["total"] or Decimal("0")
+    approved = queryset.filter(status=Production.APPROVED).aggregate(total=Sum("realized_value"))["total"] or Decimal("0")
+    context = _list_context(
+        "Produção financeira", queryset, "production_create", start=start, end=end,
+        selected_contract=request.GET.get("contract", ""), selected_truck=request.GET.get("truck", ""), selected_driver=request.GET.get("driver", ""), selected_status=request.GET.get("status", ""),
+        production_contracts=Contract.objects.filter(company=company), production_trucks=Truck.objects.filter(company=company), production_drivers=Driver.objects.filter(company=company), production_statuses=Production.STATUS_CHOICES,
+        summary={"total": total, "count": queryset.count(), "approved": approved, "active_contracts": queryset.values("contract_id").distinct().count()},
+        production_chart=json.dumps({"labels": [date(row["competence__year"], row["competence__month"], 1).strftime("%b/%y") for row in monthly_rows], "values": [float(row["total"] or 0) for row in monthly_rows], "starts": [date(row["competence__year"], row["competence__month"], 1).isoformat() for row in monthly_rows], "ends": [date(row["competence__year"], row["competence__month"], monthrange(row["competence__year"], row["competence__month"])[1]).isoformat() for row in monthly_rows]}),
+        production_status_chart=json.dumps({"labels": [status_labels[row["status"]] for row in status_rows], "keys": [row["status"] for row in status_rows], "values": [float(row["total"] or 0) for row in status_rows], "counts": [row["count"] for row in status_rows]}),
+        production_contract_chart=json.dumps({"labels": [row["contract__code"] for row in contract_rows], "ids": [row["contract_id"] for row in contract_rows], "values": [float(row["total"] or 0) for row in contract_rows]}),
+    )
+    return render(request, "fleet/production.html", context)
 
 
 @manager_required
@@ -557,8 +591,30 @@ def rule_create(request):
 
 @manager_required
 def fixed_cost_list(request):
-    company = current_company(request.user); queryset = FixedCost.objects.filter(company=company).select_related("truck")
-    return render(request, "fleet/list.html", _list_context("Custos fixos", queryset, "fixed_cost_create", columns=[("description", "Descrição"), ("get_category_display", "Categoria"), ("truck", "Caminhão"), ("monthly_amount", "Valor mensal"), ("valid_from", "Início"), ("active", "Ativo")]))
+    company = current_company(request.user)
+    start, end = filter_period(request)
+    queryset = FixedCost.objects.filter(company=company, valid_from__lte=end).filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start)).select_related("truck")
+    selected_category = request.GET.get("category", "")
+    selected_truck = request.GET.get("truck", "")
+    selected_active = request.GET.get("active", "")
+    if selected_category:
+        queryset = queryset.filter(category=selected_category)
+    if selected_truck:
+        queryset = queryset.filter(truck_id=selected_truck)
+    if selected_active:
+        queryset = queryset.filter(active=selected_active == "1")
+    category_labels = dict(FixedCost.CATEGORY_CHOICES)
+    category_rows = list(queryset.values("category").annotate(total=Sum("monthly_amount")).order_by("category"))
+    truck_rows = list(queryset.filter(truck__isnull=False).values("truck_id", "truck__identification").annotate(total=Sum("monthly_amount")).order_by("-total"))
+    monthly_total = queryset.filter(active=True).aggregate(total=Sum("monthly_amount"))["total"] or Decimal("0")
+    context = _list_context(
+        "Custos fixos", queryset, "fixed_cost_create", start=start, end=end, trucks=Truck.objects.filter(company=company), categories=FixedCost.CATEGORY_CHOICES,
+        selected_category=selected_category, selected_truck=selected_truck, selected_active=selected_active,
+        summary={"monthly": monthly_total, "annual": monthly_total * Decimal("12"), "active_count": queryset.filter(active=True).count(), "count": queryset.count()},
+        fixed_category_chart=json.dumps({"labels": [category_labels[row["category"]] for row in category_rows], "keys": [row["category"] for row in category_rows], "values": [float(row["total"] or 0) for row in category_rows]}),
+        fixed_truck_chart=json.dumps({"labels": [row["truck__identification"] for row in truck_rows], "ids": [row["truck_id"] for row in truck_rows], "values": [float(row["total"] or 0) for row in truck_rows]}),
+    )
+    return render(request, "fleet/fixed_costs.html", context)
 
 
 @manager_required
@@ -573,11 +629,21 @@ def fixed_cost_create(request):
 def remuneration_view(request):
     company = current_company(request.user)
     competence = parse_date(request.GET.get("competence") + "-01" if request.GET.get("competence") and len(request.GET.get("competence")) == 7 else request.GET.get("competence"), timezone.localdate()).replace(day=1)
-    drivers = Driver.objects.filter(company=company, status=Driver.ACTIVE); rows = []
+    selected_driver = request.GET.get("driver", "")
+    drivers = Driver.objects.filter(company=company, status=Driver.ACTIVE)
+    if selected_driver:
+        drivers = drivers.filter(pk=selected_driver)
+    rows = []
     for driver in drivers:
         calculation = calculate_driver_remuneration(driver, competence); remuneration, _ = Remuneration.objects.get_or_create(company=company, driver=driver, competence=competence.replace(day=1), defaults={**{key: calculation[key] for key in ("fixed_amount", "commission_base_value", "commission_percent", "commission_amount", "km_bonus", "trips_bonus", "other_bonus", "total_amount", "calculation_notes")}, "created_by": request.user, "updated_by": request.user})
         rows.append((driver, calculation, remuneration))
-    return render(request, "fleet/remuneration.html", {"company": company, "competence": competence.replace(day=1), "rows": rows})
+    totals = {key: sum((row[1][key] for row in rows), Decimal("0")) for key in ("fixed_amount", "commission_amount", "km_bonus", "trips_bonus", "other_bonus", "total_amount")}
+    history = []
+    for offset in range(-5, 1):
+        month = shift_month(competence, offset)
+        monthly = [calculate_driver_remuneration(driver, month) for driver in drivers]
+        history.append({"label": month.strftime("%b/%y"), "competence": month.strftime("%Y-%m"), "total": float(sum((item["total_amount"] for item in monthly), Decimal("0"))), "fixed": float(sum((item["fixed_amount"] for item in monthly), Decimal("0"))), "commission": float(sum((item["commission_amount"] for item in monthly), Decimal("0"))), "bonus": float(sum((item["km_bonus"] + item["trips_bonus"] + item["other_bonus"] for item in monthly), Decimal("0")))})
+    return render(request, "fleet/remuneration.html", {"company": company, "competence": competence.replace(day=1), "rows": rows, "drivers": Driver.objects.filter(company=company, status=Driver.ACTIVE), "selected_driver": selected_driver, "summary": totals, "remuneration_driver_chart": json.dumps({"labels": [row[0].name for row in rows], "ids": [row[0].pk for row in rows], "fixed": [float(row[1]["fixed_amount"]) for row in rows], "commission": [float(row[1]["commission_amount"]) for row in rows], "bonus": [float(row[1]["km_bonus"] + row[1]["trips_bonus"] + row[1]["other_bonus"]) for row in rows], "total": [float(row[1]["total_amount"]) for row in rows]}), "remuneration_history_chart": json.dumps(history)})
 
 
 @driver_required
@@ -622,6 +688,10 @@ def report_view(request, report_name):
     company = current_company(request.user); start, end = filter_period(request); base = {"company": company, "start": start, "end": end, "report_name": report_name}
     if report_name == "custos":
         selected_truck = request.GET.get("truck", "")
+        cost_components = (("fuel", "Combustível"), ("maintenance", "Manutenção"), ("tires", "Pneus"), ("financing", "Financiamento"), ("fixed", "Custos fixos"), ("remuneration", "Remuneração"))
+        selected_component = request.GET.get("component", "")
+        if selected_component not in dict(cost_components):
+            selected_component = ""
         truck_queryset = Truck.objects.filter(company=company)
         if selected_truck:
             truck_queryset = truck_queryset.filter(pk=selected_truck)
@@ -631,9 +701,11 @@ def report_view(request, report_name):
             distance = Trip.objects.filter(company=company, truck=truck, status=Trip.FINISHED, started_at__date__range=(start, end)).aggregate(value=Sum("distance_km"))["value"] or Decimal("0")
             total = sum(costs.values(), Decimal("0"))
             rows.append({"truck": truck, **costs, "distance": distance, "cost_per_km": total / distance if distance else Decimal("0"), "total": total})
+        if selected_component:
+            rows = [row for row in rows if row[selected_component] > 0]
         selected_ids = list(truck_queryset.values_list("id", flat=True)) if selected_truck else None
         metrics = dashboard_metrics(company, start, end, selected_ids)
-        base.update({"title": "Custos por caminhão", "trucks": Truck.objects.filter(company=company), "selected_truck": selected_truck, "rows": rows, "summary": {"fuel": metrics["fuel"], "maintenance": metrics["maintenance"], "tires": metrics["tires"], "financing": metrics["financing"], "fixed": metrics["fixed"], "remuneration": metrics["remuneration"], "total": metrics["total_cost"], "distance": metrics["distance"], "cost_per_km": metrics["cost_per_km"]}, "cost_chart": json.dumps({"labels": ["Combustível", "Manutenção", "Pneus", "Financiamento", "Custos fixos", "Remuneração"], "values": [float(metrics["fuel"]), float(metrics["maintenance"]), float(metrics["tires"]), float(metrics["financing"]), float(metrics["fixed"]), float(metrics["remuneration"])]}), "truck_chart": json.dumps({"labels": [row["truck"].identification for row in rows], "values": [float(row["total"]) for row in rows]})})
+        base.update({"title": "Custos por caminhão", "trucks": Truck.objects.filter(company=company), "selected_truck": selected_truck, "selected_component": selected_component, "selected_component_label": dict(cost_components).get(selected_component, ""), "cost_components": cost_components, "rows": rows, "summary": {"fuel": metrics["fuel"], "maintenance": metrics["maintenance"], "tires": metrics["tires"], "financing": metrics["financing"], "fixed": metrics["fixed"], "remuneration": metrics["remuneration"], "total": metrics["total_cost"], "distance": metrics["distance"], "cost_per_km": metrics["cost_per_km"]}, "cost_chart": json.dumps({"labels": [label for key, label in cost_components], "keys": [key for key, label in cost_components], "values": [float(metrics[key]) for key, label in cost_components]}), "truck_chart": json.dumps({"labels": [row["truck"].identification for row in rows], "ids": [row["truck"].pk for row in rows], "values": [float(row[selected_component] if selected_component else row["total"]) for row in rows]})})
         return render(request, "fleet/costs_report.html", base)
     elif report_name == "resultado":
         selected_truck = request.GET.get("truck", "")
@@ -652,7 +724,7 @@ def report_view(request, report_name):
         selected_ids = list(truck_queryset.values_list("id", flat=True)) if selected_truck else None
         metrics = dashboard_metrics(company, start, end, selected_ids)
         margin = metrics["result"] / metrics["revenue"] * Decimal("100") if metrics["revenue"] else Decimal("0")
-        base.update({"title": "Resultado operacional estimado", "trucks": Truck.objects.filter(company=company), "selected_truck": selected_truck, "rows": rows, "summary": {"revenue": metrics["revenue"], "cost": metrics["total_cost"], "result": metrics["result"], "distance": metrics["distance"], "cost_per_km": metrics["cost_per_km"], "margin": margin, "fuel": metrics["fuel"], "maintenance": metrics["maintenance"], "tires": metrics["tires"], "financing": metrics["financing"], "fixed": metrics["fixed"], "remuneration": metrics["remuneration"]}, "result_chart": json.dumps({"labels": [row["truck"].identification for row in rows], "revenue": [float(row["revenue"]) for row in rows], "cost": [float(row["cost"]) for row in rows], "result": [float(row["result"]) for row in rows]}), "monthly_result_chart": json.dumps(monthly_chart_data(company, start, end, selected_ids))})
+        base.update({"title": "Resultado operacional estimado", "trucks": Truck.objects.filter(company=company), "selected_truck": selected_truck, "rows": rows, "summary": {"revenue": metrics["revenue"], "cost": metrics["total_cost"], "result": metrics["result"], "distance": metrics["distance"], "cost_per_km": metrics["cost_per_km"], "margin": margin, "fuel": metrics["fuel"], "maintenance": metrics["maintenance"], "tires": metrics["tires"], "financing": metrics["financing"], "fixed": metrics["fixed"], "remuneration": metrics["remuneration"]}, "result_chart": json.dumps({"labels": [row["truck"].identification for row in rows], "ids": [row["truck"].pk for row in rows], "revenue": [float(row["revenue"]) for row in rows], "cost": [float(row["cost"]) for row in rows], "result": [float(row["result"]) for row in rows]}), "monthly_result_chart": json.dumps(monthly_chart_data(company, start, end, selected_ids))})
         return render(request, "fleet/result_report.html", base)
     elif report_name == "abastecimentos":
         base.update({"title": "Abastecimentos e consumo", "columns": [("truck", "Caminhão"), ("fueled_at", "Data"), ("city", "Cidade"), ("liters", "Litros"), ("total_amount", "Valor"), ("price_per_liter", "R$/L"), ("km_per_liter", "Km/L")], "rows": Fueling.objects.filter(company=company, fueled_at__date__range=(start, end)).select_related("truck")})

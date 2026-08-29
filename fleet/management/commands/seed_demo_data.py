@@ -75,14 +75,17 @@ class Command(BaseCommand):
             month = (today.replace(day=1) - timedelta(days=month_index * 30)).replace(day=1)
             for truck_index, truck in enumerate(trucks):
                 driver = drivers[(truck_index + month_index) % len(drivers)]
-                start_km = Decimal("100000") + truck_index * 1000 + Decimal( month_index * 850)
+                start_km = Decimal("100000") + truck_index * 1000 + Decimal((6 - month_index) * 850)
                 trip_time = timezone.make_aware(datetime.combine(month.replace(day=min(8 + truck_index, 25)), time(7, 0)))
                 trip_key = f"DEMO-SEED-TRIP-{truck.identification}-{month:%Y-%m}"
                 trip, _ = Trip.objects.get_or_create(company=company, truck=truck, driver=driver, contract=contracts[truck_index % 3], started_at=trip_time, defaults={"origin": "São Paulo (demo)", "destination": "Campinas (demo)", "start_odometer": start_km, "end_odometer": start_km + Decimal("132.0"), "ended_at": trip_time + timedelta(hours=3, minutes=20), "distance_km": Decimal("132.0"), "duration": timedelta(hours=3, minutes=20), "status": Trip.FINISHED, "notes": trip_key, "created_by": manager, "updated_by": manager})
                 trip.status = Trip.FINISHED
                 trip.save(update_fields=["status"])
                 fuel_time = trip_time + timedelta(hours=1)
-                Fueling.objects.get_or_create(company=company, truck=truck, fueled_at=fuel_time, notes=f"DEMO-SEED-FUEL-{truck.identification}-{month:%Y-%m}", defaults={"driver": driver, "trip": trip, "city": "Campinas", "state": "SP", "station": "Posto Horizonte Demo", "fuel_type": truck.fuel_type, "odometer": start_km + Decimal("132.0"), "liters": Decimal("260.00") + truck_index * 10, "total_amount": (Decimal("260.00") + truck_index * 10) * Decimal("5.89"), "tank_full": True, "created_by": manager, "updated_by": manager})
+                fueling, _ = Fueling.objects.get_or_create(company=company, truck=truck, fueled_at=fuel_time, notes=f"DEMO-SEED-FUEL-{truck.identification}-{month:%Y-%m}", defaults={"driver": driver, "trip": trip, "city": "Campinas", "state": "SP", "station": "Posto Horizonte Demo", "fuel_type": truck.fuel_type, "odometer": start_km + Decimal("132.0"), "liters": Decimal("260.00") + truck_index * 10, "total_amount": (Decimal("260.00") + truck_index * 10) * Decimal("5.89"), "tank_full": True, "created_by": manager, "updated_by": manager})
+                fueling.driver, fueling.trip, fueling.city, fueling.state, fueling.station, fueling.fuel_type = driver, trip, "Campinas", "SP", "Posto Horizonte Demo", truck.fuel_type
+                fueling.odometer, fueling.liters, fueling.total_amount, fueling.tank_full = start_km + Decimal("132.0"), Decimal("260.00") + truck_index * 10, (Decimal("260.00") + truck_index * 10) * Decimal("5.89"), True
+                fueling.save()
                 if month_index in (2, 5):
                     Maintenance.objects.get_or_create(company=company, truck=truck, date=month.replace(day=18), description=f"Revisão periódica {truck.identification}", defaults={"maintenance_type": Maintenance.PREVENTIVE, "odometer": start_km + Decimal("132"), "workshop": "Oficina Horizonte Demo", "amount": Decimal("1800") + truck_index * 250, "downtime_days": 1, "next_date": month.replace(day=18) + timedelta(days=180), "status": Maintenance.DONE, "created_by": manager, "updated_by": manager})
                 if month_index in (3, 6):
