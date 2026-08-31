@@ -2,8 +2,9 @@ from django import forms
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from django.utils import timezone
 
-from .models import Contract, Driver, Financing, FixedCost, Fueling, Maintenance, Occurrence, Production, RemunerationRule, Stop, TireExpense, Trip, Truck
+from .models import CashEntry, Contract, Driver, Financing, FixedCost, Fueling, Maintenance, MaintenancePlan, Occurrence, Production, RemunerationRule, Stop, TireExpense, Trip, Truck, VehicleChecklist
 
 
 class StyledModelForm(forms.ModelForm):
@@ -101,8 +102,29 @@ class TripStartForm(StyledModelForm):
         self.fields["contract"].queryset = Contract.objects.filter(company=self.company, status=Contract.ACTIVE)
 
 
+class TripPlanForm(StyledModelForm):
+    class Meta:
+        model = Trip
+        fields = ["truck", "driver", "contract", "origin", "destination", "planned_start_at", "planned_end_at", "cargo_description", "cargo_weight", "delivery_reference", "start_odometer", "notes"]
+        widgets = {"planned_start_at": forms.DateTimeInput(attrs={"type": "datetime-local"}), "planned_end_at": forms.DateTimeInput(attrs={"type": "datetime-local"}), "cargo_weight": forms.NumberInput(attrs={"step": "0.01", "min": 0}), "start_odometer": forms.NumberInput(attrs={"step": "0.1", "placeholder": "Quilometragem prevista"})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.company:
+            self.instance.company = self.company
+        self.fields["truck"].queryset = Truck.objects.filter(company=self.company, status=Truck.OPERATING)
+        self.fields["driver"].queryset = Driver.objects.filter(company=self.company, status=Driver.ACTIVE)
+        self.fields["contract"].queryset = Contract.objects.filter(company=self.company, status=Contract.ACTIVE)
+
+
+class TripStartPlannedForm(forms.Form):
+    start_odometer = forms.DecimalField(label="Quilometragem inicial", min_value=0, decimal_places=1, max_digits=12, widget=forms.NumberInput(attrs={"class": "form-control", "step": "0.1"}))
+    notes = forms.CharField(label="Observação", required=False, widget=forms.Textarea(attrs={"class": "form-control", "rows": 3}))
+
+
 class TripFinishForm(forms.Form):
     end_odometer = forms.DecimalField(label="Quilometragem final", min_value=0, decimal_places=1, max_digits=12, widget=forms.NumberInput(attrs={"class": "form-control", "step": "0.1"}))
+    delivery_proof = forms.FileField(label="Comprovante de entrega", required=False, help_text="Foto ou arquivo da entrega, se disponível.", widget=forms.ClearableFileInput(attrs={"class": "form-control", "accept": "image/*,.pdf"}))
     notes = forms.CharField(label="Observação", required=False, widget=forms.Textarea(attrs={"class": "form-control", "rows": 3}))
 
 
@@ -110,14 +132,30 @@ class StopForm(StyledModelForm):
     class Meta:
         model = Stop
         fields = ["location", "started_at", "ended_at", "reason", "odometer", "notes"]
-        widgets = {"started_at": forms.DateTimeInput(attrs={"type": "datetime-local"}), "ended_at": forms.DateTimeInput(attrs={"type": "datetime-local"}), "odometer": forms.NumberInput(attrs={"step": "0.1"})}
+        widgets = {"started_at": forms.DateTimeInput(attrs={"type": "datetime-local"}, format="%Y-%m-%dT%H:%M"), "ended_at": forms.DateTimeInput(attrs={"type": "datetime-local"}, format="%Y-%m-%dT%H:%M"), "odometer": forms.NumberInput(attrs={"step": "0.1"})}
+
+    def __init__(self, *args, trip=None, **kwargs):
+        self.trip = trip
+        super().__init__(*args, **kwargs)
+        if not self.is_bound:
+            self.initial.setdefault("started_at", timezone.localtime().replace(second=0, microsecond=0))
+
+    def clean(self):
+        cleaned = super().clean()
+        started_at, ended_at = cleaned.get("started_at"), cleaned.get("ended_at")
+        trip_start = self.trip.started_at.replace(second=0, microsecond=0) if self.trip and self.trip.started_at else None
+        if trip_start and started_at and started_at < trip_start:
+            self.add_error("started_at", "A pausa não pode começar antes do início da viagem.")
+        if trip_start and ended_at and ended_at < trip_start:
+            self.add_error("ended_at", "A pausa não pode terminar antes do início da viagem.")
+        return cleaned
 
 
 class FuelingForm(StyledModelForm):
     class Meta:
         model = Fueling
         exclude = ["company", "driver", "price_per_liter", "km_per_liter", "created_at", "updated_at", "created_by", "updated_by"]
-        widgets = {"fueled_at": forms.DateTimeInput(attrs={"type": "datetime-local"}), "odometer": forms.NumberInput(attrs={"step": "0.1"}), "liters": forms.NumberInput(attrs={"step": "0.01"}), "total_amount": forms.NumberInput(attrs={"step": "0.01"})}
+        widgets = {"fueled_at": forms.DateTimeInput(attrs={"type": "datetime-local"}, format="%Y-%m-%dT%H:%M"), "odometer": forms.NumberInput(attrs={"step": "0.1"}), "liters": forms.NumberInput(attrs={"step": "0.01"}), "total_amount": forms.NumberInput(attrs={"step": "0.01"})}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -125,10 +163,37 @@ class FuelingForm(StyledModelForm):
         self.fields["trip"].queryset = Trip.objects.filter(company=self.company)
         if self.user and hasattr(self.user, "driver_record"):
             self.fields["trip"].queryset = self.fields["trip"].queryset.filter(driver=self.user.driver_record)
+        if not self.is_bound:
+            self.initial.setdefault("fueled_at", timezone.localtime().replace(second=0, microsecond=0))
 
     def clean(self):
         cleaned = super().clean()
         if cleaned.get("trip") and cleaned.get("truck") and cleaned["trip"].truck_id != cleaned["truck"].id:
+            raise ValidationError("O trecho selecionado pertence a outro caminhão.")
+        trip, fueled_at = cleaned.get("trip"), cleaned.get("fueled_at")
+        trip_start = trip.started_at.replace(second=0, microsecond=0) if trip and trip.started_at else None
+        if trip_start and fueled_at and fueled_at < trip_start:
+            self.add_error("fueled_at", "O abastecimento não pode ser anterior ao início da viagem.")
+        if trip and fueled_at and trip.ended_at and fueled_at > trip.ended_at:
+            self.add_error("fueled_at", "O abastecimento não pode ser posterior ao fim da viagem.")
+        return cleaned
+
+
+class VehicleChecklistForm(StyledModelForm):
+    class Meta:
+        model = VehicleChecklist
+        fields = ["truck", "trip", "tires_ok", "lights_ok", "oil_ok", "brakes_ok", "documents_ok", "notes"]
+
+    def __init__(self, *args, driver=None, **kwargs):
+        self.driver = driver
+        super().__init__(*args, **kwargs)
+        self.fields["truck"].queryset = Truck.objects.filter(company=self.company, status=Truck.OPERATING)
+        self.fields["trip"].queryset = Trip.objects.filter(company=self.company, driver=driver, status=Trip.IN_PROGRESS)
+
+    def clean(self):
+        cleaned = super().clean()
+        trip, truck = cleaned.get("trip"), cleaned.get("truck")
+        if trip and truck and trip.truck_id != truck.id:
             raise ValidationError("O trecho selecionado pertence a outro caminhão.")
         return cleaned
 
@@ -144,6 +209,19 @@ class MaintenanceForm(StyledModelForm):
         self.fields["truck"].queryset = Truck.objects.filter(company=self.company)
 
 
+class MaintenancePlanForm(StyledModelForm):
+    class Meta:
+        model = MaintenancePlan
+        exclude = ["company", "created_at", "updated_at", "created_by", "updated_by"]
+        widgets = {"next_due_date": forms.DateInput(attrs={"type": "date"}), "next_due_odometer": forms.NumberInput(attrs={"step": "0.1"}), "interval_km": forms.NumberInput(attrs={"step": "0.1"})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.company:
+            self.instance.company = self.company
+        self.fields["truck"].queryset = Truck.objects.filter(company=self.company)
+
+
 class TireExpenseForm(StyledModelForm):
     class Meta:
         model = TireExpense
@@ -153,6 +231,20 @@ class TireExpenseForm(StyledModelForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fields["truck"].queryset = Truck.objects.filter(company=self.company)
+
+
+class CashEntryForm(StyledModelForm):
+    class Meta:
+        model = CashEntry
+        exclude = ["company", "created_at", "updated_at", "created_by", "updated_by", "paid_at"]
+        widgets = {"due_date": forms.DateInput(attrs={"type": "date"}), "amount": forms.NumberInput(attrs={"step": "0.01", "min": 0})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.company:
+            self.instance.company = self.company
+        self.fields["truck"].queryset = Truck.objects.filter(company=self.company)
+        self.fields["contract"].queryset = Contract.objects.filter(company=self.company)
 
 
 class ProductionForm(StyledModelForm):

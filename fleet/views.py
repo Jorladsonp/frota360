@@ -10,24 +10,26 @@ from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
 from django.contrib.auth.decorators import login_required
 from django.db import transaction
-from django.db.models import Avg, Count, Q, Sum
+from django.db.models import Avg, Count, F, Q, Sum
 from django.http import HttpResponse, HttpResponseForbidden
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.views.decorators.http import require_GET
 
 from .forms import (
-    ContractForm, DriverForm, FinancingForm, FixedCostForm, FuelingForm, MaintenanceForm,
+    CashEntryForm, ContractForm, DriverForm, FinancingForm, FixedCostForm, FuelingForm, MaintenanceForm, MaintenancePlanForm,
     OccurrenceForm, ProductionForm, RemunerationRuleForm, StopForm, TireExpenseForm,
-    TripFinishForm, TripStartForm, TruckForm,
+    TripFinishForm, TripPlanForm, TripStartForm, TripStartPlannedForm, TruckForm, VehicleChecklistForm,
 )
 from .models import (
-    AuditLog, Company, Contract, Driver, FixedCost, Fueling, Maintenance, Occurrence,
+    AuditLog, CashEntry, Company, Contract, Driver, FixedCost, Fueling, Maintenance, MaintenancePlan, Occurrence,
     Production, Remuneration, RemunerationRule, Stop, TireExpense, Trip, Truck,
     UserProfile,
+    VehicleChecklist,
 )
 from .permissions import company_for, driver_required, manager_required, profile_for
-from .services import calculate_driver_remuneration, calculate_fixed_cost_allocation, month_bounds, period_months, production_allocation, remuneration_truck_allocation, truck_costs
+from .services import calculate_driver_remuneration, calculate_fixed_cost_allocation, month_bounds, production_allocation, prorated_monthly_amount, remuneration_truck_allocation, truck_costs
 
 
 def current_company(user):
@@ -37,6 +39,32 @@ def current_company(user):
     if user.is_superuser:
         return Company.objects.filter(active=True).first()
     return None
+
+
+@require_GET
+def pwa_service_worker(request):
+    """Serve the worker at the site root so the driver PWA can cover its routes."""
+    response = HttpResponse(
+        """const CACHE = 'frota360-static-v2';
+const ASSETS = ['/static/fleet/app.css', '/static/fleet/app.js', '/static/fleet/pwa-icon.svg'];
+self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(ASSETS)).then(() => self.skipWaiting())));
+self.addEventListener('activate', event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(key => key.startsWith('frota360-static-') && key !== CACHE).map(key => caches.delete(key)))).then(() => self.clients.claim())));
+self.addEventListener('fetch', event => {
+  const request = event.request;
+  if (request.method !== 'GET' || new URL(request.url).origin !== self.location.origin) return;
+  if (new URL(request.url).pathname.startsWith('/static/')) {
+    event.respondWith(fetch(request).then(response => {
+      const copy = response.clone();
+      caches.open(CACHE).then(cache => cache.put(request, copy));
+      return response;
+    }).catch(() => caches.match(request).then(cached => cached || caches.match(new URL(request.url).pathname))));
+  }
+});""",
+        content_type="application/javascript",
+    )
+    response["Service-Worker-Allowed"] = "/"
+    response["Cache-Control"] = "no-cache"
+    return response
 
 
 def snapshot(instance):
@@ -49,6 +77,8 @@ def snapshot(instance):
             value = str(value)
         elif isinstance(value, timedelta):
             value = str(value)
+        elif hasattr(value, "storage") and hasattr(value, "name"):
+            value = value.name
         elif hasattr(value, "pk"):
             value = value.pk
         data[field.name] = value
@@ -81,7 +111,82 @@ def shift_month(value, months):
 def filter_period(request):
     today = timezone.localdate()
     default_start = today.replace(day=1) - timedelta(days=150)
-    return parse_date(request.GET.get("start"), default_start), parse_date(request.GET.get("end"), today)
+    start, end = parse_date(request.GET.get("start"), default_start), parse_date(request.GET.get("end"), today)
+    return (end, start) if start > end else (start, end)
+
+
+def operational_filter_context(request, company, default_days=30):
+    today = timezone.localdate()
+    start = parse_date(request.GET.get("start"), today - timedelta(days=default_days - 1))
+    end = parse_date(request.GET.get("end"), today)
+    if start > end:
+        start, end = end, start
+    selected = {key: request.GET.get(key, "") for key in ("truck", "driver", "contract", "status", "fuel_type", "city", "state", "tank_full")}
+    return {
+        "start": start,
+        "end": end,
+        "trucks": Truck.objects.filter(company=company),
+        "drivers": Driver.objects.filter(company=company, status=Driver.ACTIVE),
+        "contracts": Contract.objects.filter(company=company),
+        "trip_statuses": Trip.STATUS_CHOICES,
+        "fuel_types": Truck.FUEL_CHOICES,
+        **{f"selected_{key}": value for key, value in selected.items()},
+    }
+
+
+def filtered_trips(company, filters):
+    queryset = Trip.objects.filter(company=company).filter(
+        Q(started_at__date__range=(filters["start"], filters["end"])) |
+        Q(status=Trip.PLANNED, created_at__date__range=(filters["start"], filters["end"]))
+    ).select_related("truck", "driver", "contract")
+    for field in ("truck", "driver", "contract", "status"):
+        if filters[f"selected_{field}"]:
+            lookup = f"{field}_id" if field != "status" else field
+            queryset = queryset.filter(**{lookup: filters[f"selected_{field}"]})
+    return queryset
+
+
+def operational_chart_data(trips, start, end):
+    status_rows = {row["status"]: row["total"] for row in trips.values("status").annotate(total=Count("id"))}
+    labels, dates, trip_counts, distance = [], [], [], []
+    cursor = start
+    while cursor <= end:
+        day = trips.filter(started_at__date=cursor)
+        labels.append(cursor.strftime("%d/%m"))
+        dates.append(cursor.isoformat())
+        trip_counts.append(day.count())
+        distance.append(float(day.aggregate(total=Sum("distance_km"))["total"] or 0))
+        cursor += timedelta(days=1)
+    truck_rows = list(trips.filter(status=Trip.FINISHED).values("truck_id", "truck__identification").annotate(distance=Sum("distance_km"), trips=Count("id")).order_by("-distance", "truck__identification"))
+    driver_rows = list(trips.filter(status=Trip.FINISHED).values("driver_id", "driver__name").annotate(distance=Sum("distance_km"), trips=Count("id")).order_by("-distance", "driver__name"))
+    return {
+        "status": {"labels": [label for key, label in Trip.STATUS_CHOICES if status_rows.get(key)], "keys": [key for key, _ in Trip.STATUS_CHOICES if status_rows.get(key)], "values": [status_rows[key] for key, _ in Trip.STATUS_CHOICES if status_rows.get(key)]},
+        "daily": {"labels": labels, "dates": dates, "trips": trip_counts, "distance": distance},
+        "trucks": {"labels": [row["truck__identification"] for row in truck_rows], "ids": [row["truck_id"] for row in truck_rows], "distance": [float(row["distance"] or 0) for row in truck_rows], "trips": [row["trips"] for row in truck_rows]},
+        "drivers": {"labels": [row["driver__name"] for row in driver_rows], "ids": [row["driver_id"] for row in driver_rows], "distance": [float(row["distance"] or 0) for row in driver_rows]},
+    }
+
+
+def fuel_chart_data(fuelings, start, end):
+    labels, starts, ends, amount, liters = [], [], [], [], []
+    cursor = start.replace(day=1)
+    while cursor <= end:
+        month_end = cursor.replace(day=monthrange(cursor.year, cursor.month)[1])
+        period_start, period_end = max(start, cursor), min(end, month_end)
+        month_fuelings = fuelings.filter(fueled_at__date__range=(period_start, period_end))
+        labels.append(cursor.strftime("%m/%Y"))
+        starts.append(period_start.isoformat())
+        ends.append(period_end.isoformat())
+        amount.append(float(month_fuelings.aggregate(total=Sum("total_amount"))["total"] or 0))
+        liters.append(float(month_fuelings.aggregate(total=Sum("liters"))["total"] or 0))
+        cursor = month_end + timedelta(days=1)
+    trucks = list(fuelings.values("truck_id", "truck__identification").annotate(amount=Sum("total_amount"), liters=Sum("liters")).order_by("-amount", "truck__identification"))
+    cities = list(fuelings.values("city", "state").annotate(amount=Sum("total_amount")).order_by("-amount", "city")[:8])
+    return {
+        "monthly": {"labels": labels, "starts": starts, "ends": ends, "amount": amount, "liters": liters},
+        "trucks": {"labels": [row["truck__identification"] for row in trucks], "ids": [row["truck_id"] for row in trucks], "amount": [float(row["amount"] or 0) for row in trucks], "liters": [float(row["liters"] or 0) for row in trucks]},
+        "cities": {"labels": [f'{row["city"]}/{row["state"]}' for row in cities], "cities": [row["city"] for row in cities], "amount": [float(row["amount"] or 0) for row in cities]},
+    }
 
 
 def dashboard_filter_context(request, company):
@@ -112,7 +217,12 @@ def dashboard_filter_context(request, company):
 def dashboard_metrics(company, start, end, truck_ids=None, driver_ids=None, contract_ids=None, city="", state="", fuel_type=""):
     trip_qs = Trip.objects.filter(company=company, status=Trip.FINISHED, started_at__date__gte=start, started_at__date__lte=end)
     fuel_qs = Fueling.objects.filter(company=company, fueled_at__date__gte=start, fueled_at__date__lte=end)
-    production_qs = Production.objects.filter(company=company, competence__gte=start, competence__lte=end).exclude(status=Production.CANCELLED)
+    production_qs = Production.objects.filter(
+        company=company,
+        competence__gte=start,
+        competence__lte=end,
+        status=Production.APPROVED,
+    )
     if truck_ids:
         trip_qs = trip_qs.filter(truck_id__in=truck_ids)
         fuel_qs = fuel_qs.filter(truck_id__in=truck_ids)
@@ -150,7 +260,7 @@ def dashboard_metrics(company, start, end, truck_ids=None, driver_ids=None, cont
         if truck_ids and item.truck_id not in truck_ids:
             continue
         if item.truck.financial_status == Truck.FINANCED and item.start_date and item.start_date <= end and (not item.expected_end_date or item.expected_end_date >= start):
-            financing += item.monthly_payment * period_months(start, end)
+            financing += prorated_monthly_amount(item.monthly_payment, start, end, item.start_date, item.expected_end_date)
     remunerations = Remuneration.objects.filter(company=company, competence__gte=start, competence__lte=end)
     if driver_ids:
         remunerations = remunerations.filter(driver_id__in=driver_ids)
@@ -159,7 +269,13 @@ def dashboard_metrics(company, start, end, truck_ids=None, driver_ids=None, cont
     fixed_costs = FixedCost.objects.filter(company=company, valid_from__lte=end, active=True).filter(Q(valid_until__isnull=True) | Q(valid_until__gte=start))
     if truck_ids:
         fixed_costs = fixed_costs.filter(Q(truck_id__in=truck_ids) | Q(truck__isnull=True))
-    fixed_value = (fixed_costs.aggregate(total=Sum("monthly_amount"))["total"] or Decimal("0")) * period_months(start, end)
+    fixed_value = sum(
+        (
+            prorated_monthly_amount(item.monthly_amount, start, end, item.valid_from, item.valid_until)
+            for item in fixed_costs
+        ),
+        Decimal("0"),
+    )
     total_cost = fuel + maintenance_value + tires_value + financing + fixed_value + remuneration
     distance = trip_qs.aggregate(total=Sum("distance_km"))["total"] or Decimal("0")
     hours = sum((trip.duration.total_seconds() for trip in trip_qs if trip.duration), 0) / 3600
@@ -287,6 +403,47 @@ def dashboard(request):
     return render(request, "fleet/dashboard.html", context)
 
 
+@manager_required
+def operation_dashboard(request):
+    company = current_company(request.user)
+    filters = operational_filter_context(request, company)
+    trips = filtered_trips(company, filters)
+    completed = trips.filter(status=Trip.FINISHED)
+    distance = completed.aggregate(total=Sum("distance_km"))["total"] or Decimal("0")
+    total_hours = sum((trip.duration.total_seconds() for trip in completed if trip.duration), 0) / 3600
+    active = Trip.objects.filter(company=company, status=Trip.IN_PROGRESS)
+    if filters["selected_truck"]:
+        active = active.filter(truck_id=filters["selected_truck"])
+    if filters["selected_driver"]:
+        active = active.filter(driver_id=filters["selected_driver"])
+    completed_with_deadline = completed.exclude(planned_end_at__isnull=True)
+    on_time = completed_with_deadline.filter(ended_at__lte=F("planned_end_at")).count()
+    delayed_active = active.exclude(planned_end_at__isnull=True).filter(planned_end_at__lt=timezone.now()).count()
+    checklists = VehicleChecklist.objects.filter(company=company, checked_at__date__range=(filters["start"], filters["end"]))
+    if filters["selected_truck"]:
+        checklists = checklists.filter(truck_id=filters["selected_truck"])
+    checklist_issues = sum(1 for item in checklists if item.has_issue)
+    occurrences = Occurrence.objects.filter(company=company, status=Occurrence.OPEN)
+    if filters["selected_truck"]:
+        occurrences = occurrences.filter(truck_id=filters["selected_truck"])
+    overdue_maintenance = Maintenance.objects.filter(company=company, status=Maintenance.DONE, next_date__lt=timezone.localdate())
+    if filters["selected_truck"]:
+        overdue_maintenance = overdue_maintenance.filter(truck_id=filters["selected_truck"])
+    context = {
+        **filters,
+        "metrics": {
+            "active": active.count(), "completed": completed.count(), "planned": trips.filter(status=Trip.PLANNED).count(),
+            "distance": distance, "hours": total_hours, "average_duration": total_hours / completed.count() if completed.exists() else 0,
+            "checklist_issues": checklist_issues, "occurrences": occurrences.count(), "maintenance": overdue_maintenance.count(),
+            "on_time": on_time, "deadline_count": completed_with_deadline.count(), "on_time_percent": on_time * 100 / completed_with_deadline.count() if completed_with_deadline.exists() else 0, "delayed_active": delayed_active,
+        },
+        "active_trips": active.select_related("truck", "driver", "contract")[:6],
+        "recent_trips": trips.order_by("-started_at", "-created_at")[:10],
+        "chart_data": json.dumps(operational_chart_data(trips, filters["start"], filters["end"])),
+    }
+    return render(request, "fleet/operation_dashboard.html", context)
+
+
 @driver_required
 def driver_dashboard(request):
     company = current_company(request.user)
@@ -295,7 +452,8 @@ def driver_dashboard(request):
     last_fuelings = Fueling.objects.filter(company=company, driver=driver).select_related("truck")[:5]
     total_km = Trip.objects.filter(company=company, driver=driver, status=Trip.FINISHED).aggregate(total=Sum("distance_km"))["total"] or Decimal("0")
     current = calculate_driver_remuneration(driver, timezone.localdate())
-    return render(request, "fleet/driver_dashboard.html", {"company": company, "driver": driver, "active_trip": active_trip, "last_fuelings": last_fuelings, "total_km": total_km, "remuneration": current})
+    planned_trips = Trip.objects.filter(company=company, driver=driver, status=Trip.PLANNED).select_related("truck", "contract")[:4]
+    return render(request, "fleet/driver_dashboard.html", {"company": company, "driver": driver, "active_trip": active_trip, "planned_trips": planned_trips, "last_fuelings": last_fuelings, "total_km": total_km, "remuneration": current})
 
 
 def _list_context(title, objects, create_url, **extra):
@@ -430,9 +588,29 @@ def contract_update(request, pk):
 def trip_list(request):
     company = current_company(request.user)
     queryset = Trip.objects.filter(company=company).select_related("truck", "driver", "contract")
-    if profile_for(request.user) and profile_for(request.user).role == UserProfile.DRIVER:
+    profile = profile_for(request.user)
+    if profile and profile.role == UserProfile.DRIVER:
         queryset = queryset.filter(driver__user=request.user)
-    return render(request, "fleet/list.html", _list_context("Trechos", queryset, "trip_start", columns=[("origin", "Origem"), ("destination", "Destino"), ("truck", "Caminhão"), ("driver", "Motorista"), ("get_status_display", "Status"), ("distance_km", "Km")], detail_url="trip_detail"))
+    create_url = "trip_start" if profile and profile.role == UserProfile.DRIVER else "trip_plan_create"
+    return render(request, "fleet/list.html", _list_context("Trechos", queryset, create_url, columns=[("origin", "Origem"), ("destination", "Destino"), ("truck", "Caminhão"), ("driver", "Motorista"), ("get_status_display", "Status"), ("distance_km", "Km")], detail_url="trip_detail"))
+
+
+@manager_required
+def trip_plan_create(request):
+    company = current_company(request.user)
+    form = TripPlanForm(request.POST or None, company=company, user=request.user)
+    if request.method == "POST" and form.is_valid():
+        trip = form.save(commit=False)
+        trip.company = company
+        trip.status = Trip.PLANNED
+        trip.created_by = request.user
+        trip.updated_by = request.user
+        trip.full_clean()
+        trip.save()
+        audit(request.user, trip, AuditLog.CREATE)
+        messages.success(request, "Trecho planejado e disponibilizado ao motorista.")
+        return redirect("trip_list")
+    return render(request, "fleet/form.html", {"title": "Planejar trecho", "form": form, "back_url": "trip_list", "helper": "O motorista confirmará a quilometragem real ao iniciar a viagem."})
 
 
 @driver_required
@@ -442,10 +620,40 @@ def trip_start(request):
     if request.method == "POST" and form.is_valid():
         trip = form.save(commit=False); trip.company = company; trip.driver = driver; trip.created_by = request.user; trip.updated_by = request.user
         try:
-            trip.full_clean(); trip.start(); trip.save(); audit(request.user, trip, AuditLog.CREATE); messages.success(request, "Trecho iniciado. Boa viagem!"); return redirect("driver_dashboard")
+            with transaction.atomic():
+                trip.truck = Truck.objects.select_for_update().get(company=company, pk=trip.truck_id)
+                trip.driver = Driver.objects.select_for_update().get(company=company, pk=driver.pk)
+                trip.full_clean(); trip.start(); trip.save(); audit(request.user, trip, AuditLog.CREATE)
+            messages.success(request, "Trecho iniciado. Boa viagem!"); return redirect("driver_dashboard")
         except Exception as exc:
             form.add_error(None, str(exc))
     return render(request, "fleet/form.html", {"title": "Iniciar trecho", "form": form, "back_url": "driver_dashboard", "helper": "A data e hora serão registradas automaticamente ao iniciar."})
+
+
+@driver_required
+def trip_start_planned(request, pk):
+    company = current_company(request.user)
+    driver = get_object_or_404(Driver, company=company, user=request.user)
+    trip = get_object_or_404(Trip.objects.select_related("truck", "contract"), company=company, driver=driver, pk=pk, status=Trip.PLANNED)
+    form = TripStartPlannedForm(request.POST or None, initial={"start_odometer": trip.truck.current_odometer, "notes": trip.notes})
+    if request.method == "POST" and form.is_valid():
+        try:
+            with transaction.atomic():
+                trip = Trip.objects.select_for_update().select_related("truck").get(company=company, driver=driver, pk=pk, status=Trip.PLANNED)
+                trip.truck = Truck.objects.select_for_update().get(company=company, pk=trip.truck_id)
+                before = snapshot(trip)
+                trip.start_odometer = form.cleaned_data["start_odometer"]
+                trip.notes = form.cleaned_data["notes"] or trip.notes
+                trip.updated_by = request.user
+                trip.full_clean()
+                trip.start()
+                trip.save()
+                audit(request.user, trip, AuditLog.UPDATE, before)
+            messages.success(request, "Trecho planejado iniciado. Boa viagem!")
+            return redirect("driver_dashboard")
+        except Exception as exc:
+            form.add_error(None, str(exc))
+    return render(request, "fleet/form.html", {"title": "Iniciar trecho planejado", "form": form, "back_url": "driver_dashboard", "helper": f"Rota: {trip.origin} → {trip.destination}. Confirme a quilometragem atual antes de sair."})
 
 
 @login_required
@@ -460,11 +668,18 @@ def trip_detail(request, pk):
 @driver_required
 def trip_finish(request, pk):
     company = current_company(request.user); driver = get_object_or_404(Driver, company=company, user=request.user); trip = get_object_or_404(Trip, company=company, driver=driver, pk=pk, status=Trip.IN_PROGRESS)
-    form = TripFinishForm(request.POST or None, initial={"end_odometer": trip.truck.current_odometer})
+    form = TripFinishForm(request.POST or None, request.FILES or None, initial={"end_odometer": trip.truck.current_odometer})
     if request.method == "POST" and form.is_valid():
         before = snapshot(trip)
         try:
-            trip.finish(form.cleaned_data["end_odometer"], form.cleaned_data["notes"]); trip.updated_by = request.user; trip.save(); audit(request.user, trip, AuditLog.UPDATE, before); messages.success(request, "Trecho finalizado e bloqueado para edição."); return redirect("driver_dashboard")
+            with transaction.atomic():
+                trip = Trip.objects.select_for_update().select_related("truck").get(company=company, driver=driver, pk=pk, status=Trip.IN_PROGRESS)
+                trip.truck = Truck.objects.select_for_update().get(company=company, pk=trip.truck_id)
+                trip.finish(form.cleaned_data["end_odometer"], form.cleaned_data["notes"])
+                if form.cleaned_data.get("delivery_proof"):
+                    trip.delivery_proof = form.cleaned_data["delivery_proof"]
+                trip.updated_by = request.user; trip.save(); audit(request.user, trip, AuditLog.UPDATE, before)
+            messages.success(request, "Trecho finalizado e bloqueado para edição."); return redirect("driver_dashboard")
         except Exception as exc:
             form.add_error("end_odometer", str(exc))
     return render(request, "fleet/form.html", {"title": "Finalizar trecho", "form": form, "back_url": "driver_dashboard", "helper": f"Trecho: {trip.origin} → {trip.destination}"})
@@ -473,7 +688,7 @@ def trip_finish(request, pk):
 @driver_required
 def stop_create(request, pk):
     company = current_company(request.user); driver = get_object_or_404(Driver, company=company, user=request.user); trip = get_object_or_404(Trip, company=company, driver=driver, pk=pk, status=Trip.IN_PROGRESS)
-    form = StopForm(request.POST or None)
+    form = StopForm(request.POST or None, trip=trip)
     if request.method == "POST" and form.is_valid():
         stop = form.save(commit=False); stop.trip = trip; stop.full_clean(); stop.save(); messages.success(request, "Parada adicionada ao trecho."); return redirect("trip_detail", pk=trip.pk)
     return render(request, "fleet/form.html", {"title": "Adicionar parada", "form": form, "back_url": "trip_detail", "back_kwargs": {"pk": trip.pk}})
@@ -485,19 +700,80 @@ def fueling_list(request):
     profile = profile_for(request.user)
     if profile and profile.role == UserProfile.DRIVER:
         queryset = queryset.filter(driver__user=request.user)
-    return render(request, "fleet/list.html", _list_context("Abastecimentos", queryset, "fueling_create", columns=[("truck", "Caminhão"), ("fueled_at", "Data"), ("city", "Cidade"), ("liters", "Litros"), ("total_amount", "Valor"), ("price_per_liter", "R$/L"), ("km_per_liter", "Km/L")]))
+        return render(request, "fleet/list.html", _list_context("Abastecimentos", queryset, "fueling_create", columns=[("truck", "Caminhão"), ("fueled_at", "Data"), ("city", "Cidade"), ("liters", "Litros"), ("total_amount", "Valor"), ("price_per_liter", "R$/L"), ("km_per_liter", "Km/L")]))
+    filters = operational_filter_context(request, company, default_days=90)
+    queryset = queryset.filter(fueled_at__date__range=(filters["start"], filters["end"]))
+    for field in ("truck", "driver", "fuel_type"):
+        if filters[f"selected_{field}"]:
+            lookup = f"{field}_id" if field in ("truck", "driver") else field
+            queryset = queryset.filter(**{lookup: filters[f"selected_{field}"]})
+    if filters["selected_city"]:
+        queryset = queryset.filter(city__icontains=filters["selected_city"])
+    if filters["selected_state"]:
+        queryset = queryset.filter(state__iexact=filters["selected_state"])
+    if filters["selected_tank_full"] in ("1", "0"):
+        queryset = queryset.filter(tank_full=filters["selected_tank_full"] == "1")
+    totals = queryset.aggregate(amount=Sum("total_amount"), liters=Sum("liters"), average_km_l=Avg("km_per_liter"), full_tanks=Count("id", filter=Q(tank_full=True)))
+    total_amount, total_liters = totals["amount"] or Decimal("0"), totals["liters"] or Decimal("0")
+    context = {
+        **filters,
+        "fuelings": queryset.order_by("-fueled_at"),
+        "metrics": {"amount": total_amount, "liters": total_liters, "average_price": total_amount / total_liters if total_liters else Decimal("0"), "average_km_l": totals["average_km_l"] or Decimal("0"), "full_tanks": totals["full_tanks"] or 0},
+        "chart_data": json.dumps(fuel_chart_data(queryset, filters["start"], filters["end"])),
+    }
+    return render(request, "fleet/fueling_management.html", context)
 
 
 @driver_required
 def fueling_create(request):
-    company = current_company(request.user); driver = get_object_or_404(Driver, company=company, user=request.user); form = FuelingForm(request.POST or None, request.FILES or None, company=company, user=request.user)
+    company = current_company(request.user); driver = get_object_or_404(Driver, company=company, user=request.user)
+    active_trip = Trip.objects.filter(company=company, driver=driver, status=Trip.IN_PROGRESS).select_related("truck").first()
+    initial = {"fueled_at": timezone.localtime().replace(second=0, microsecond=0)}
+    if active_trip:
+        initial.update({"trip": active_trip.pk, "truck": active_trip.truck_id, "odometer": active_trip.truck.current_odometer})
+    form = FuelingForm(request.POST or None, request.FILES or None, company=company, user=request.user, initial=initial)
     if request.method == "POST" and form.is_valid():
         fueling = form.save(commit=False); fueling.company = company; fueling.driver = driver; fueling.created_by = request.user; fueling.updated_by = request.user
         try:
-            fueling.full_clean(); fueling.save(); audit(request.user, fueling, AuditLog.CREATE); messages.success(request, "Abastecimento registrado."); return redirect("driver_dashboard")
+            with transaction.atomic():
+                fueling.truck = Truck.objects.select_for_update().get(company=company, pk=fueling.truck_id)
+                fueling.full_clean(); fueling.save(); audit(request.user, fueling, AuditLog.CREATE)
+            messages.success(request, "Abastecimento registrado."); return redirect("driver_dashboard")
         except Exception as exc:
             form.add_error(None, str(exc))
     return render(request, "fleet/form.html", {"title": "Registrar abastecimento", "form": form, "back_url": "driver_dashboard", "helper": "O preço por litro é calculado automaticamente. Km/L só aparece com tanque completo e histórico válido."})
+
+
+@login_required
+def checklist_list(request):
+    company = current_company(request.user)
+    queryset = VehicleChecklist.objects.filter(company=company).select_related("truck", "driver", "trip")
+    profile = profile_for(request.user)
+    if profile and profile.role == UserProfile.DRIVER:
+        queryset = queryset.filter(driver__user=request.user)
+    create_url = "checklist_create" if profile and profile.role == UserProfile.DRIVER else None
+    return render(request, "fleet/list.html", _list_context("Checklists do veículo", queryset, create_url, columns=[("checked_at", "Data"), ("truck", "Caminhão"), ("driver", "Motorista"), ("status_label", "Situação")]))
+
+
+@driver_required
+def checklist_create(request):
+    company = current_company(request.user)
+    driver = get_object_or_404(Driver, company=company, user=request.user)
+    active_trip = Trip.objects.filter(company=company, driver=driver, status=Trip.IN_PROGRESS).first()
+    initial = {"truck": active_trip.truck_id, "trip": active_trip.pk} if active_trip else None
+    form = VehicleChecklistForm(request.POST or None, company=company, user=request.user, driver=driver, initial=initial)
+    if request.method == "POST" and form.is_valid():
+        checklist = form.save(commit=False)
+        checklist.company = company
+        checklist.driver = driver
+        checklist.created_by = request.user
+        checklist.updated_by = request.user
+        checklist.full_clean()
+        checklist.save()
+        audit(request.user, checklist, AuditLog.CREATE)
+        messages.success(request, "Checklist registrado." if not checklist.has_issue else "Checklist registrado com pendências para acompanhamento.")
+        return redirect("driver_dashboard")
+    return render(request, "fleet/form.html", {"title": "Checklist do veículo", "form": form, "back_url": "driver_dashboard", "helper": "Desmarque apenas os itens com problema e descreva a situação nas observações."})
 
 
 @driver_required
@@ -521,8 +797,26 @@ def occurrence_create(request):
 
 @manager_required
 def maintenance_list(request):
-    company = current_company(request.user); queryset = Maintenance.objects.filter(company=company).select_related("truck")
-    return render(request, "fleet/list.html", _list_context("Manutenções", queryset, "maintenance_create", columns=[("truck", "Caminhão"), ("get_maintenance_type_display", "Tipo"), ("date", "Data"), ("description", "Descrição"), ("amount", "Valor"), ("get_status_display", "Status")]))
+    company = current_company(request.user)
+    filters = operational_filter_context(request, company, default_days=90)
+    queryset = Maintenance.objects.filter(company=company, date__range=(filters["start"], filters["end"])).select_related("truck")
+    if filters["selected_truck"]:
+        queryset = queryset.filter(truck_id=filters["selected_truck"])
+    selected_type, selected_status = request.GET.get("type", ""), request.GET.get("status", "")
+    if selected_type in dict(Maintenance.TYPE_CHOICES):
+        queryset = queryset.filter(maintenance_type=selected_type)
+    if selected_status in dict(Maintenance.STATUS_CHOICES):
+        queryset = queryset.filter(status=selected_status)
+    plans = MaintenancePlan.objects.filter(company=company, active=True).select_related("truck")
+    if filters["selected_truck"]:
+        plans = plans.filter(truck_id=filters["selected_truck"])
+    due_plans = [plan for plan in plans if plan.due_status == "Vencido"]
+    total_cost = queryset.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    total_downtime = queryset.aggregate(total=Sum("downtime_days"))["total"] or 0
+    by_type = list(queryset.values("maintenance_type").annotate(value=Sum("amount")).order_by("-value"))
+    by_truck = list(queryset.values("truck_id", "truck__identification").annotate(value=Sum("amount")).order_by("-value"))
+    context = {**filters, "maintenances": queryset.order_by("-date"), "plans": plans[:8], "due_plans": due_plans[:8], "selected_type": selected_type, "selected_status": selected_status, "maintenance_types": Maintenance.TYPE_CHOICES, "maintenance_statuses": Maintenance.STATUS_CHOICES, "metrics": {"cost": total_cost, "downtime": total_downtime, "open": queryset.filter(status=Maintenance.OPEN).count(), "due": len(due_plans)}, "chart_data": json.dumps({"types": {"labels": [dict(Maintenance.TYPE_CHOICES).get(row["maintenance_type"]) for row in by_type], "keys": [row["maintenance_type"] for row in by_type], "values": [float(row["value"] or 0) for row in by_type]}, "trucks": {"labels": [row["truck__identification"] for row in by_truck], "ids": [row["truck_id"] for row in by_truck], "values": [float(row["value"] or 0) for row in by_truck]}})}
+    return render(request, "fleet/maintenance_management.html", context)
 
 
 @manager_required
@@ -531,6 +825,58 @@ def maintenance_create(request):
     if request.method == "POST" and form.is_valid():
         obj = form.save(); audit(request.user, obj, AuditLog.CREATE); messages.success(request, "Manutenção registrada."); return redirect("maintenance_list")
     return render(request, "fleet/form.html", {"title": "Nova manutenção", "form": form, "back_url": "maintenance_list"})
+
+
+@manager_required
+def maintenance_plan_create(request):
+    company = current_company(request.user); form = MaintenancePlanForm(request.POST or None, company=company, user=request.user)
+    if request.method == "POST" and form.is_valid():
+        obj = form.save(); audit(request.user, obj, AuditLog.CREATE); messages.success(request, "Plano preventivo criado."); return redirect("maintenance_list")
+    return render(request, "fleet/form.html", {"title": "Novo plano preventivo", "form": form, "back_url": "maintenance_list", "helper": "Defina a próxima revisão por data, quilometragem ou ambos."})
+
+
+@manager_required
+def cashflow_view(request):
+    company = current_company(request.user)
+    filters = operational_filter_context(request, company, default_days=90)
+    queryset = CashEntry.objects.filter(company=company, due_date__range=(filters["start"], filters["end"])).select_related("truck", "contract")
+    selected_type, selected_status = request.GET.get("entry_type", ""), request.GET.get("status", "")
+    if selected_type in dict(CashEntry.ENTRY_TYPE_CHOICES): queryset = queryset.filter(entry_type=selected_type)
+    if selected_status in dict(CashEntry.STATUS_CHOICES): queryset = queryset.filter(status=selected_status)
+    if filters["selected_truck"]: queryset = queryset.filter(truck_id=filters["selected_truck"])
+    receivable = queryset.filter(entry_type=CashEntry.RECEIVABLE).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    payable = queryset.filter(entry_type=CashEntry.PAYABLE).aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    pending = list(queryset.exclude(status__in=(CashEntry.PAID, CashEntry.CANCELLED)))
+    overdue = [entry for entry in pending if entry.is_overdue]
+    categories = list(queryset.values("category", "entry_type").annotate(value=Sum("amount")).order_by("-value")[:8])
+    context = {**filters, "entries": queryset.order_by("due_date"), "selected_type": selected_type, "selected_status": selected_status, "entry_types": CashEntry.ENTRY_TYPE_CHOICES, "cash_statuses": CashEntry.STATUS_CHOICES, "metrics": {"receivable": receivable, "payable": payable, "projected": receivable - payable, "pending": sum((entry.amount for entry in pending), Decimal("0")), "overdue": sum((entry.amount for entry in overdue), Decimal("0"))}, "chart_data": json.dumps({"labels": [row["category"] for row in categories], "keys": [row["entry_type"] for row in categories], "values": [float(row["value"] or 0) for row in categories]})}
+    return render(request, "fleet/cashflow.html", context)
+
+
+@manager_required
+def cash_entry_create(request):
+    company = current_company(request.user); form = CashEntryForm(request.POST or None, request.FILES or None, company=company, user=request.user)
+    if request.method == "POST" and form.is_valid():
+        obj = form.save(); audit(request.user, obj, AuditLog.CREATE); messages.success(request, "Conta financeira registrada."); return redirect("cashflow_view")
+    return render(request, "fleet/form.html", {"title": "Nova conta financeira", "form": form, "back_url": "cashflow_view"})
+
+
+@manager_required
+def cash_entry_transition(request, pk, action):
+    company = current_company(request.user); entry = get_object_or_404(CashEntry, company=company, pk=pk)
+    if request.method != "POST":
+        return HttpResponseForbidden("Ação inválida.")
+    before = snapshot(entry)
+    if action == "approve" and entry.status == CashEntry.PENDING:
+        entry.status = CashEntry.APPROVED
+    elif action == "pay" and entry.status in (CashEntry.PENDING, CashEntry.APPROVED):
+        entry.status, entry.paid_at = CashEntry.PAID, timezone.localdate()
+    else:
+        messages.error(request, "Esta transição não está disponível para a conta.")
+        return redirect("cashflow_view")
+    entry.updated_by = request.user; entry.save(); audit(request.user, entry, AuditLog.UPDATE, before, action)
+    messages.success(request, "Conta aprovada." if action == "approve" else "Conta liquidada.")
+    return redirect("cashflow_view")
 
 
 @manager_required

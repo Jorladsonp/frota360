@@ -3,6 +3,7 @@ from decimal import Decimal
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models import F, Q
 from django.utils import timezone
 
 
@@ -177,6 +178,11 @@ class Trip(CompanyModel):
     contract = models.ForeignKey(Contract, on_delete=models.PROTECT, related_name="trips")
     origin = models.CharField("origem", max_length=120)
     destination = models.CharField("destino", max_length=120)
+    planned_start_at = models.DateTimeField("início previsto", null=True, blank=True)
+    planned_end_at = models.DateTimeField("entrega prevista", null=True, blank=True)
+    cargo_description = models.CharField("carga", max_length=180, blank=True)
+    cargo_weight = models.DecimalField("peso da carga (kg)", max_digits=12, decimal_places=2, null=True, blank=True)
+    delivery_reference = models.CharField("referência de entrega", max_length=80, blank=True)
     start_odometer = models.DecimalField("quilometragem inicial", max_digits=12, decimal_places=1)
     end_odometer = models.DecimalField("quilometragem final", max_digits=12, decimal_places=1, null=True, blank=True)
     started_at = models.DateTimeField("início", null=True, blank=True)
@@ -184,11 +190,18 @@ class Trip(CompanyModel):
     distance_km = models.DecimalField("quilômetros rodados", max_digits=12, decimal_places=1, default=0)
     duration = models.DurationField("duração", null=True, blank=True)
     status = models.CharField("status", max_length=15, choices=STATUS_CHOICES, default=PLANNED)
+    delivery_proof = models.FileField("comprovante de entrega", upload_to="deliveries/%Y/%m/", null=True, blank=True)
     notes = models.TextField("observações", blank=True)
 
     class Meta:
         ordering = ["-started_at", "-created_at"]
         indexes = [models.Index(fields=["company", "status"]), models.Index(fields=["company", "started_at"])]
+        constraints = [
+            models.UniqueConstraint(fields=["truck"], condition=Q(status="IN_PROGRESS"), name="one_open_trip_per_truck"),
+            models.UniqueConstraint(fields=["driver"], condition=Q(status="IN_PROGRESS"), name="one_open_trip_per_driver"),
+            models.CheckConstraint(condition=Q(end_odometer__isnull=True) | Q(end_odometer__gte=F("start_odometer")), name="trip_end_odometer_not_before_start"),
+            models.CheckConstraint(condition=Q(ended_at__isnull=True) | Q(started_at__isnull=True) | Q(ended_at__gte=F("started_at")), name="trip_end_not_before_start"),
+        ]
         verbose_name = "trecho"
         verbose_name_plural = "trechos"
 
@@ -201,6 +214,10 @@ class Trip(CompanyModel):
             errors["end_odometer"] = "A quilometragem final não pode ser menor que a inicial."
         if self.started_at and self.ended_at and self.ended_at < self.started_at:
             errors["ended_at"] = "A data final não pode ser anterior à data inicial."
+        if self.planned_start_at and self.planned_end_at and self.planned_end_at < self.planned_start_at:
+            errors["planned_end_at"] = "A entrega prevista não pode ser anterior ao início previsto."
+        if self.cargo_weight is not None and self.cargo_weight < 0:
+            errors["cargo_weight"] = "O peso da carga não pode ser negativo."
         if errors:
             raise ValidationError(errors)
 
@@ -235,13 +252,29 @@ class Trip(CompanyModel):
         if self.pk:
             previous = Trip.objects.filter(pk=self.pk).first()
             if previous and previous.status == self.FINISHED and self.status == self.FINISHED:
-                locked_fields = ("truck_id", "driver_id", "contract_id", "origin", "destination", "start_odometer", "end_odometer", "started_at", "ended_at", "distance_km", "duration", "notes")
+                locked_fields = ("truck_id", "driver_id", "contract_id", "origin", "destination", "planned_start_at", "planned_end_at", "cargo_description", "cargo_weight", "delivery_reference", "start_odometer", "end_odometer", "started_at", "ended_at", "distance_km", "duration", "delivery_proof", "notes")
                 if any(getattr(previous, field) != getattr(self, field) for field in locked_fields):
                     raise ValidationError("Trecho finalizado está bloqueado. Reabra-o para correção antes de editar.")
         super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.origin} → {self.destination} · {self.truck.identification}"
+
+    @property
+    def delay_minutes(self):
+        if not self.planned_end_at or not self.ended_at:
+            return None
+        return max(int((self.ended_at - self.planned_end_at).total_seconds() / 60), 0)
+
+    @property
+    def schedule_label(self):
+        if not self.planned_end_at:
+            return "Sem prazo informado"
+        if self.ended_at:
+            return "No prazo" if self.delay_minutes == 0 else f"Atraso de {self.delay_minutes} min"
+        if self.status == self.IN_PROGRESS and timezone.now() > self.planned_end_at:
+            return "Prazo excedido"
+        return "Prazo programado"
 
 
 class Stop(models.Model):
@@ -259,8 +292,17 @@ class Stop(models.Model):
         verbose_name_plural = "paradas"
 
     def clean(self):
+        errors = {}
         if self.ended_at and self.ended_at < self.started_at:
-            raise ValidationError("O fim da parada não pode ser anterior ao início.")
+            errors["ended_at"] = "O fim da parada não pode ser anterior ao início."
+        if self.trip_id and self.trip.started_at:
+            trip_start = self.trip.started_at.replace(second=0, microsecond=0)
+            if self.started_at and self.started_at < trip_start:
+                errors["started_at"] = "A pausa não pode começar antes do início da viagem."
+            if self.ended_at and self.ended_at < trip_start:
+                errors["ended_at"] = "A pausa não pode terminar antes do início da viagem."
+        if errors:
+            raise ValidationError(errors)
 
     def __str__(self):
         return f"{self.location} · {self.reason}"
@@ -287,6 +329,10 @@ class Fueling(CompanyModel):
     class Meta:
         ordering = ["-fueled_at"]
         indexes = [models.Index(fields=["company", "fueled_at"])]
+        constraints = [
+            models.CheckConstraint(condition=Q(liters__gt=0), name="fueling_liters_positive"),
+            models.CheckConstraint(condition=Q(total_amount__gte=0), name="fueling_total_not_negative"),
+        ]
         verbose_name = "abastecimento"
         verbose_name_plural = "abastecimentos"
 
@@ -298,6 +344,11 @@ class Fueling(CompanyModel):
             errors["total_amount"] = "O valor não pode ser negativo."
         if self.odometer is not None and self.truck_id and self.odometer < self.truck.current_odometer:
             errors["odometer"] = "A quilometragem não pode ser menor que o último registro do caminhão."
+        trip_start = self.trip.started_at.replace(second=0, microsecond=0) if self.trip_id and self.trip.started_at else None
+        if trip_start and self.fueled_at and self.fueled_at < trip_start:
+            errors["fueled_at"] = "O abastecimento não pode ser anterior ao início da viagem."
+        if self.trip_id and self.trip.ended_at and self.fueled_at and self.fueled_at > self.trip.ended_at:
+            errors["fueled_at"] = "O abastecimento não pode ser posterior ao fim da viagem."
         if errors:
             raise ValidationError(errors)
 
@@ -306,15 +357,66 @@ class Fueling(CompanyModel):
             self.price_per_liter = self.total_amount / self.liters
         self.km_per_liter = None
         if self.tank_full and self.truck_id:
-            previous = Fueling.objects.filter(truck_id=self.truck_id, tank_full=True).exclude(pk=self.pk).filter(fueled_at__lt=self.fueled_at).order_by("-fueled_at").first()
+            previous = Fueling.objects.filter(
+                truck_id=self.truck_id,
+                fuel_type=self.fuel_type,
+                tank_full=True,
+                fueled_at__lt=self.fueled_at,
+            ).exclude(pk=self.pk).order_by("-fueled_at").first()
             if previous and self.odometer > previous.odometer:
-                self.km_per_liter = (self.odometer - previous.odometer) / self.liters
+                liters_since_previous_full = Fueling.objects.filter(
+                    truck_id=self.truck_id,
+                    fuel_type=self.fuel_type,
+                    fueled_at__gt=previous.fueled_at,
+                    fueled_at__lte=self.fueled_at,
+                ).exclude(pk=self.pk).aggregate(total=models.Sum("liters"))["total"] or Decimal("0")
+                liters_since_previous_full += self.liters
+                if liters_since_previous_full > 0:
+                    self.km_per_liter = (self.odometer - previous.odometer) / liters_since_previous_full
         super().save(*args, **kwargs)
         if self.truck_id and self.odometer > self.truck.current_odometer:
             Truck.objects.filter(pk=self.truck_id).update(current_odometer=self.odometer)
 
     def __str__(self):
         return f"{self.truck.identification} · {self.liters} L"
+
+
+class VehicleChecklist(CompanyModel):
+    """A short pre-trip inspection designed for quick completion on a phone."""
+
+    truck = models.ForeignKey(Truck, on_delete=models.PROTECT, related_name="checklists")
+    driver = models.ForeignKey(Driver, on_delete=models.PROTECT, related_name="checklists")
+    trip = models.ForeignKey(Trip, on_delete=models.SET_NULL, related_name="checklists", null=True, blank=True)
+    checked_at = models.DateTimeField("data e hora", default=timezone.now)
+    tires_ok = models.BooleanField("pneus em condição", default=True)
+    lights_ok = models.BooleanField("luzes e sinalização", default=True)
+    oil_ok = models.BooleanField("óleo e fluidos", default=True)
+    brakes_ok = models.BooleanField("freios", default=True)
+    documents_ok = models.BooleanField("documentação", default=True)
+    notes = models.TextField("observações", blank=True)
+
+    class Meta:
+        ordering = ["-checked_at"]
+        indexes = [models.Index(fields=["company", "checked_at"]), models.Index(fields=["truck", "checked_at"])]
+        verbose_name = "checklist do veículo"
+        verbose_name_plural = "checklists dos veículos"
+
+    def clean(self):
+        if self.truck_id and self.driver_id and (self.truck.company_id != self.company_id or self.driver.company_id != self.company_id):
+            raise ValidationError("Caminhão, motorista e checklist devem pertencer à mesma empresa.")
+        if self.trip_id and (self.trip.company_id != self.company_id or self.trip.truck_id != self.truck_id or self.trip.driver_id != self.driver_id):
+            raise ValidationError("O trecho selecionado deve corresponder ao caminhão e ao motorista do checklist.")
+
+    @property
+    def has_issue(self):
+        return not all((self.tires_ok, self.lights_ok, self.oil_ok, self.brakes_ok, self.documents_ok))
+
+    @property
+    def status_label(self):
+        return "Com pendência" if self.has_issue else "Conforme"
+
+    def __str__(self):
+        return f"Checklist · {self.truck.identification} · {self.checked_at:%d/%m/%Y}"
 
 
 class Maintenance(CompanyModel):
@@ -353,6 +455,41 @@ class Maintenance(CompanyModel):
         return f"{self.truck.identification} · {self.get_maintenance_type_display()}"
 
 
+class MaintenancePlan(CompanyModel):
+    """Preventive schedule kept separately from the work actually performed."""
+
+    truck = models.ForeignKey(Truck, on_delete=models.PROTECT, related_name="maintenance_plans")
+    maintenance_type = models.CharField("tipo", max_length=12, choices=Maintenance.TYPE_CHOICES)
+    title = models.CharField("serviço planejado", max_length=180)
+    interval_days = models.PositiveIntegerField("periodicidade em dias", null=True, blank=True)
+    interval_km = models.DecimalField("periodicidade em km", max_digits=12, decimal_places=1, null=True, blank=True)
+    next_due_date = models.DateField("próxima data", null=True, blank=True)
+    next_due_odometer = models.DecimalField("próxima quilometragem", max_digits=12, decimal_places=1, null=True, blank=True)
+    active = models.BooleanField("ativo", default=True)
+    notes = models.TextField("observações", blank=True)
+
+    class Meta:
+        ordering = ["next_due_date", "next_due_odometer", "title"]
+        indexes = [models.Index(fields=["company", "active"]), models.Index(fields=["truck", "active"])]
+        verbose_name = "plano preventivo"
+        verbose_name_plural = "planos preventivos"
+
+    def clean(self):
+        if self.truck_id and self.truck.company_id != self.company_id:
+            raise ValidationError("O caminhão do plano deve pertencer à mesma empresa.")
+        if not self.next_due_date and self.next_due_odometer is None:
+            raise ValidationError("Informe uma próxima data ou quilometragem para o plano preventivo.")
+
+    @property
+    def due_status(self):
+        if (self.next_due_date and self.next_due_date <= timezone.localdate()) or (self.next_due_odometer is not None and self.truck.current_odometer >= self.next_due_odometer):
+            return "Vencido"
+        return "Programado"
+
+    def __str__(self):
+        return f"{self.truck.identification} · {self.title}"
+
+
 class TireExpense(CompanyModel):
     truck = models.ForeignKey(Truck, on_delete=models.PROTECT, related_name="tire_expenses")
     date = models.DateField("data")
@@ -369,6 +506,60 @@ class TireExpense(CompanyModel):
 
     def __str__(self):
         return f"Pneus · {self.truck.identification}"
+
+
+class CashEntry(CompanyModel):
+    PAYABLE = "PAYABLE"
+    RECEIVABLE = "RECEIVABLE"
+    ENTRY_TYPE_CHOICES = [(PAYABLE, "Conta a pagar"), (RECEIVABLE, "Conta a receber")]
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    PAID = "PAID"
+    CANCELLED = "CANCELLED"
+    STATUS_CHOICES = [(PENDING, "Pendente"), (APPROVED, "Aprovada"), (PAID, "Liquidada"), (CANCELLED, "Cancelada")]
+    entry_type = models.CharField("tipo", max_length=12, choices=ENTRY_TYPE_CHOICES)
+    category = models.CharField("categoria", max_length=80)
+    description = models.CharField("descrição", max_length=180)
+    amount = models.DecimalField("valor", max_digits=14, decimal_places=2)
+    due_date = models.DateField("vencimento")
+    paid_at = models.DateField("liquidação", null=True, blank=True)
+    status = models.CharField("situação", max_length=12, choices=STATUS_CHOICES, default=PENDING)
+    truck = models.ForeignKey(Truck, on_delete=models.PROTECT, related_name="cash_entries", null=True, blank=True)
+    contract = models.ForeignKey(Contract, on_delete=models.PROTECT, related_name="cash_entries", null=True, blank=True)
+    reference = models.CharField("documento/referência", max_length=100, blank=True)
+    attachment = models.FileField("anexo", upload_to="cash/%Y/%m/", null=True, blank=True)
+    notes = models.TextField("observações", blank=True)
+
+    class Meta:
+        ordering = ["due_date", "entry_type", "description"]
+        indexes = [models.Index(fields=["company", "due_date", "status"]), models.Index(fields=["company", "entry_type", "status"])]
+        verbose_name = "conta financeira"
+        verbose_name_plural = "contas financeiras"
+
+    def clean(self):
+        errors = {}
+        if self.amount is None or self.amount <= 0:
+            errors["amount"] = "O valor deve ser maior que zero."
+        if self.truck_id and self.truck.company_id != self.company_id:
+            errors["truck"] = "O caminhão deve pertencer à mesma empresa."
+        if self.contract_id and self.contract.company_id != self.company_id:
+            errors["contract"] = "O contrato deve pertencer à mesma empresa."
+        if self.paid_at and self.paid_at < self.due_date and self.status == self.PAID:
+            # Antecipação é permitida; this branch only keeps the rule explicit for future changes.
+            pass
+        if errors:
+            raise ValidationError(errors)
+
+    @property
+    def is_overdue(self):
+        return self.status in (self.PENDING, self.APPROVED) and self.due_date < timezone.localdate()
+
+    @property
+    def status_label(self):
+        return "Vencida" if self.is_overdue else self.get_status_display()
+
+    def __str__(self):
+        return f"{self.get_entry_type_display()} · {self.description}"
 
 
 class FixedCost(CompanyModel):

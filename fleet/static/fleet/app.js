@@ -3,34 +3,21 @@ function initAppChrome() {
   document.documentElement.dataset.appChromeInitialized = 'true';
   const appShell = document.querySelector('.app-shell');
   const sidebar = document.getElementById('mainSidebar');
-  const brandName = sidebar && sidebar.querySelector('.brand > span:not(.brand-mark)');
-  if (brandName) brandName.classList.add('brand-name');
   const mobileToggle = document.querySelector('[data-sidebar-toggle]');
   if (mobileToggle && sidebar) mobileToggle.addEventListener('click', () => sidebar.classList.toggle('open'));
   if (appShell && sidebar) {
-    const collapse = document.createElement('button');
-    collapse.type = 'button';
-    collapse.className = 'btn sidebar-expand d-none d-lg-inline-flex';
-    collapse.setAttribute('data-sidebar-collapse', '');
-    collapse.setAttribute('aria-label', 'Abrir ou recolher menu');
-    collapse.title = 'Abrir ou recolher menu';
-    collapse.innerHTML = '<i class="bi bi-layout-sidebar-inset"></i>';
-    const topbar = document.querySelector('.topbar');
-    const context = document.querySelector('.topbar-context');
-    if (topbar && context) topbar.insertBefore(collapse, context);
+    const collapseButtons = document.querySelectorAll('[data-sidebar-collapse]');
     let collapsed = false;
     try { collapsed = window.localStorage.getItem('frota360:sidebar') === 'collapsed'; } catch (error) { /* menu aberto por padrão */ }
     const setCollapsed = next => {
       appShell.classList.toggle('sidebar-collapsed', next);
-      document.querySelectorAll('[data-sidebar-collapse]').forEach(button => {
-        const icon = button.querySelector('i');
-        if (icon && button.classList.contains('sidebar-collapse')) icon.className = next ? 'bi bi-chevron-right' : 'bi bi-chevron-left';
+      collapseButtons.forEach(button => {
         button.setAttribute('aria-label', next ? 'Abrir menu' : 'Recolher menu');
         button.title = next ? 'Abrir menu' : 'Recolher menu';
       });
     };
     setCollapsed(collapsed);
-    document.querySelectorAll('[data-sidebar-collapse]').forEach(button => button.addEventListener('click', () => {
+    collapseButtons.forEach(button => button.addEventListener('click', () => {
       const next = !appShell.classList.contains('sidebar-collapsed');
       setCollapsed(next);
       try { window.localStorage.setItem('frota360:sidebar', next ? 'collapsed' : 'expanded'); } catch (error) { /* memória visual apenas */ }
@@ -38,15 +25,18 @@ function initAppChrome() {
   }
   const topbar = document.querySelector('.topbar');
   const userMenu = document.querySelector('.user-menu');
+  const topbarActions = document.querySelector('.topbar-actions') || topbar;
   if (topbar && userMenu && !document.querySelector('[data-theme-toggle]')) {
     const theme = document.createElement('button');
     theme.type = 'button';
     theme.className = 'theme-toggle';
     theme.setAttribute('data-theme-toggle', '');
     theme.innerHTML = '<i class="bi bi-moon-stars"></i><span data-theme-label>Modo escuro</span>';
-    topbar.insertBefore(theme, userMenu);
+    topbarActions.insertBefore(theme, userMenu);
     const applyTheme = dark => {
       document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      const themeColor = document.querySelector('[data-theme-color]');
+      if (themeColor) themeColor.setAttribute('content', dark ? '#111827' : '#3867f4');
       theme.setAttribute('aria-pressed', String(dark));
       theme.querySelector('i').className = dark ? 'bi bi-sun' : 'bi bi-moon-stars';
       theme.querySelector('[data-theme-label]').textContent = dark ? 'Modo claro' : 'Modo escuro';
@@ -66,6 +56,60 @@ function initAppChrome() {
 
 initAppChrome();
 document.addEventListener('DOMContentLoaded', initAppChrome);
+
+function registerPwa() {
+  if (!('serviceWorker' in navigator) || !window.isSecureContext) return;
+  navigator.serviceWorker.register('/service-worker.js').then(registration => registration.update()).catch(error => {
+    console.info('PWA indisponível neste ambiente:', error);
+  });
+}
+
+window.addEventListener('load', registerPwa);
+
+function initDriverDrafts() {
+  if (!document.body.classList.contains('driver-app')) return;
+  const content = document.querySelector('.page-content');
+  const noticeId = 'driver-connection-notice';
+  const updateConnection = () => {
+    let notice = document.getElementById(noticeId);
+    if (!content) return;
+    if (!navigator.onLine) {
+      if (!notice) {
+        notice = document.createElement('div');
+        notice.id = noticeId;
+        notice.className = 'driver-connection-notice';
+        content.prepend(notice);
+      }
+      notice.innerHTML = '<i class="bi bi-wifi-off"></i><span>Você está sem conexão. Seus campos ficam salvos neste aparelho até a conexão voltar.</span>';
+    } else if (notice) notice.remove();
+  };
+  updateConnection();
+  window.addEventListener('online', updateConnection);
+  window.addEventListener('offline', updateConnection);
+  document.querySelectorAll('form[data-offline-draft]').forEach(form => {
+    const key = `frota360:draft:${window.location.pathname}`;
+    let saved = {};
+    try { saved = JSON.parse(window.localStorage.getItem(key) || '{}'); } catch (error) { saved = {}; }
+    form.querySelectorAll('input,select,textarea').forEach(field => {
+      if (!field.name || field.type === 'file' || field.type === 'hidden') return;
+      if (Object.hasOwn(saved, field.name)) {
+        if (field.type === 'checkbox') field.checked = Boolean(saved[field.name]);
+        else if (!field.value) field.value = saved[field.name];
+      }
+      field.addEventListener('input', () => {
+        const draft = {};
+        form.querySelectorAll('input,select,textarea').forEach(item => {
+          if (!item.name || item.type === 'file' || item.type === 'hidden') return;
+          draft[item.name] = item.type === 'checkbox' ? item.checked : item.value;
+        });
+        try { window.localStorage.setItem(key, JSON.stringify(draft)); } catch (error) { /* sem armazenamento disponível */ }
+      });
+    });
+    form.addEventListener('submit', () => { try { window.localStorage.removeItem(key); } catch (error) { /* rascunho expira na próxima gravação */ } });
+  });
+}
+
+window.addEventListener('DOMContentLoaded', initDriverDrafts);
 
 function fleetCharts(data, operating, maintenance, inactive, breakdown = {}) {
   const chartFont = {family: 'DM Sans'};
@@ -162,6 +206,52 @@ function initFinancialInteractionControls() {
   updateFinancialInteractionControls();
 }
 
+let financialPageUpdating = false;
+
+async function refreshFinancialPage(url, updateHistory = true) {
+  if (financialPageUpdating) return;
+  const content = document.querySelector('.page-content');
+  if (!content) {
+    window.location.assign(url.toString());
+    return;
+  }
+  financialPageUpdating = true;
+  const scrollPosition = window.scrollY;
+  content.setAttribute('aria-busy', 'true');
+  try {
+    const response = await fetch(url.toString(), {headers: {'X-Requested-With': 'XMLHttpRequest'}});
+    if (!response.ok) throw new Error(`Falha ao atualizar o filtro: ${response.status}`);
+    const markup = await response.text();
+    const nextDocument = new DOMParser().parseFromString(markup, 'text/html');
+    const nextContent = nextDocument.querySelector('.page-content');
+    if (!nextContent) throw new Error('A resposta não contém o conteúdo da página.');
+    if (window.Chart && window.Chart.getChart) {
+      document.querySelectorAll('canvas').forEach(canvas => {
+        const chart = window.Chart.getChart(canvas);
+        if (chart) chart.destroy();
+      });
+    }
+    content.replaceChildren(...Array.from(nextContent.childNodes, node => document.importNode(node, true)));
+    if (updateHistory) window.history.pushState({financialFilter: true}, '', url.toString());
+    nextDocument.querySelectorAll('script:not([src])').forEach(script => {
+      if (script.textContent.trim()) new Function(script.textContent)();
+    });
+    initFinancialInteractionControls();
+    initAsyncFilters();
+    window.scrollTo(0, scrollPosition);
+  } catch (error) {
+    console.error(error);
+    window.location.assign(url.toString());
+  } finally {
+    content.removeAttribute('aria-busy');
+    financialPageUpdating = false;
+  }
+}
+
+window.addEventListener('popstate', () => {
+  if (document.querySelector('canvas[data-financial-chart]')) refreshFinancialPage(new URL(window.location.href), false);
+});
+
 function financialDrilldown(filterSets) {
   return function(event, elements) {
     if (!financialInteractionsEnabled()) return;
@@ -172,8 +262,24 @@ function financialDrilldown(filterSets) {
     const isSelected = Object.entries(filters).every(([key, value]) => url.searchParams.get(key) === String(value));
     Object.entries(filters).forEach(([key, value]) => isSelected ? url.searchParams.delete(key) : url.searchParams.set(key, value));
     url.searchParams.delete('page');
-    window.location.assign(url.toString());
+    refreshFinancialPage(url);
   };
+}
+
+function initAsyncFilters() {
+  document.querySelectorAll('form[data-async-filter]').forEach(form => {
+    if (form.dataset.asyncFilterInitialized) return;
+    form.dataset.asyncFilterInitialized = 'true';
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      const url = new URL(form.action || window.location.href, window.location.origin);
+      url.search = '';
+      new FormData(form).forEach((value, key) => {
+        if (String(value).trim()) url.searchParams.set(key, value);
+      });
+      refreshFinancialPage(url);
+    });
+  });
 }
 
 function financialScales(money = true) {
@@ -226,4 +332,54 @@ function remunerationCharts(history, drivers) {
   }
 }
 
+function operationCharts(data) {
+  if (!window.Chart) return;
+  const status = data.status || {};
+  const statusColors = {PLANNED:'#9bb5ff',IN_PROGRESS:'#ec8b39',FINISHED:'#149b76',CANCELLED:'#9aa7ba',REOPENED:'#7b61d8'};
+  financialDoughnut('operationStatusChart', status.labels, status.values, (status.keys || []).map(key => statusColors[key] || '#3867f4'), (status.keys || []).map(key => ({status:key})), false, true);
+  const daily = data.daily || {};
+  const dailyCanvas = document.getElementById('operationDailyChart');
+  if (dailyCanvas) {
+    dailyCanvas.dataset.financialChart = 'true';
+    dailyCanvas.style.cursor = financialInteractionsEnabled() ? 'pointer' : 'default';
+    new Chart(dailyCanvas, {type:'bar',data:{labels:daily.labels || [],datasets:[{label:'Trechos iniciados',data:daily.trips || [],backgroundColor:'#9bb5ff',borderRadius:6,yAxisID:'trips'},{label:'Km concluídos',data:daily.distance || [],type:'line',borderColor:'#149b76',backgroundColor:'rgba(20,155,118,.12)',fill:true,tension:.35,pointRadius:3,yAxisID:'distance'}]},options:{responsive:true,maintainAspectRatio:false,onClick:financialDrilldown((daily.dates || []).map(day => ({start:day,end:day}))),plugins:{legend:{position:'bottom',labels:{font:{family:'DM Sans'}}}},scales:{x:{grid:{display:false},ticks:{font:{family:'DM Sans'}}},trips:{beginAtZero:true,position:'left',grid:{color:financialChartGrid()},ticks:{precision:0,font:{family:'DM Sans'}}},distance:{beginAtZero:true,position:'right',grid:{drawOnChartArea:false},ticks:{font:{family:'DM Sans'},callback:value=>Number(value).toLocaleString('pt-BR')+' km'}}}}});
+  }
+  const trucks = data.trucks || {};
+  financialBar('operationTruckChart', trucks.labels, trucks.distance, '#3867f4', (trucks.ids || []).map(id => ({truck:id})), false, (trucks.labels || []).length > 5);
+  const drivers = data.drivers || {};
+  financialBar('operationDriverChart', drivers.labels, drivers.distance, '#7b61d8', (drivers.ids || []).map(id => ({driver:id})), false, (drivers.labels || []).length > 5);
+}
+
+function fuelingManagementCharts(data) {
+  if (!window.Chart) return;
+  const monthly = data.monthly || {};
+  const monthlyCanvas = document.getElementById('fuelMonthlyChart');
+  if (monthlyCanvas) {
+    monthlyCanvas.dataset.financialChart = 'true';
+    monthlyCanvas.style.cursor = financialInteractionsEnabled() ? 'pointer' : 'default';
+    new Chart(monthlyCanvas, {type:'bar',data:{labels:monthly.labels || [],datasets:[{label:'Gasto',data:monthly.amount || [],backgroundColor:'#ec8b39',borderRadius:6,yAxisID:'amount'},{label:'Litros',data:monthly.liters || [],type:'line',borderColor:'#3867f4',backgroundColor:'rgba(56,103,244,.1)',fill:true,tension:.35,pointRadius:3,yAxisID:'liters'}]},options:{responsive:true,maintainAspectRatio:false,onClick:financialDrilldown((monthly.starts || []).map((start,index) => ({start,end:(monthly.ends || [])[index]}))),plugins:{legend:{position:'bottom',labels:{font:{family:'DM Sans'}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label === 'Gasto' ? `Gasto: ${financialMoney(ctx.raw)}` : `Litros: ${Number(ctx.raw).toLocaleString('pt-BR')} L`}}},scales:{x:{grid:{display:false},ticks:{font:{family:'DM Sans'}}},amount:{beginAtZero:true,position:'left',grid:{color:financialChartGrid()},ticks:{font:{family:'DM Sans'},callback:financialMoney}},liters:{beginAtZero:true,position:'right',grid:{drawOnChartArea:false},ticks:{font:{family:'DM Sans'},callback:value=>Number(value).toLocaleString('pt-BR')+' L'}}}}});
+  }
+  const trucks = data.trucks || {};
+  financialBar('fuelTruckChart', trucks.labels, trucks.amount, '#ec8b39', (trucks.ids || []).map(id => ({truck:id})), true, (trucks.labels || []).length > 5);
+  const cities = data.cities || {};
+  financialBar('fuelCityChart', cities.labels, cities.amount, '#7b61d8', (cities.cities || []).map(city => ({city})), true, (cities.labels || []).length > 5);
+}
+
+function maintenanceManagementCharts(data) {
+  if (!window.Chart) return;
+  const types = data.types || {};
+  financialDoughnut('maintenanceTypeChart', types.labels, types.values, ['#df5b66','#ec8b39','#7b61d8','#3867f4','#149b76','#9aa7ba'], (types.keys || []).map(type => ({type})), true, true);
+  const trucks = data.trucks || {};
+  financialBar('maintenanceTruckChart', trucks.labels, trucks.values, '#df5b66', (trucks.ids || []).map(id => ({truck:id})), true, (trucks.labels || []).length > 5);
+}
+
+function cashflowCharts(data) {
+  if (!window.Chart) return;
+  const payable = '#df5b66';
+  const receivable = '#149b76';
+  const colors = (data.keys || []).map(key => key === 'RECEIVABLE' ? receivable : payable);
+  financialDoughnut('cashCategoryChart', data.labels, data.values, colors, [], true, true);
+}
+
 initFinancialInteractionControls();
+initAsyncFilters();

@@ -1,0 +1,19 @@
+{
+  "name": "Frota360 Motorista",
+  "short_name": "Frota360",
+  "description": "Registros simples da operação de transporte.",
+  "start_url": "/motorista/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f9fc",
+  "theme_color": "#3867f4",
+  "lang": "pt-BR",
+  "icons": [
+    {
+      "src": "/static/fleet/pwa-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

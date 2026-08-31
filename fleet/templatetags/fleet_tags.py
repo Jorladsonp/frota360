@@ -1,8 +1,22 @@
 from decimal import Decimal
+from os.path import getmtime
 
 from django import template
+from django.contrib.staticfiles import finders
 
 register = template.Library()
+
+
+@register.simple_tag
+def static_version(path):
+    """Returns a local static file timestamp so browsers fetch changed assets."""
+    resolved = finders.find(path)
+    if isinstance(resolved, (list, tuple)):
+        resolved = resolved[0] if resolved else None
+    try:
+        return int(getmtime(resolved)) if resolved else "1"
+    except OSError:
+        return "1"
 
 
 @register.filter

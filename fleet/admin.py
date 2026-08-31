@@ -1,9 +1,9 @@
 from django.contrib import admin
 
 from .models import (
-    AuditLog, Company, Contract, Driver, Financing, FixedCost, Fueling, Maintenance,
+    AuditLog, CashEntry, Company, Contract, Driver, Financing, FixedCost, Fueling, Maintenance, MaintenancePlan,
     Occurrence, Production, Remuneration, RemunerationRule, Stop, TireExpense, Trip,
-    Truck, UserProfile,
+    Truck, UserProfile, VehicleChecklist,
 )
 
 
@@ -96,11 +96,32 @@ class FuelingAdmin(CompanyScopedAdmin):
     search_fields = ("truck__identification", "station", "city")
 
 
+@admin.register(VehicleChecklist)
+class VehicleChecklistAdmin(CompanyScopedAdmin):
+    list_display = ("checked_at", "truck", "driver", "has_issue", "company")
+    list_filter = ("company", "truck", "driver")
+    search_fields = ("truck__identification", "driver__name", "notes")
+
+
 @admin.register(Maintenance)
 class MaintenanceAdmin(CompanyScopedAdmin):
     list_display = ("truck", "maintenance_type", "date", "amount", "status", "company")
     list_filter = ("company", "maintenance_type", "status", "truck")
     search_fields = ("truck__identification", "description", "workshop")
+
+
+@admin.register(MaintenancePlan)
+class MaintenancePlanAdmin(CompanyScopedAdmin):
+    list_display = ("truck", "title", "maintenance_type", "next_due_date", "next_due_odometer", "active", "company")
+    list_filter = ("company", "active", "maintenance_type", "truck")
+    search_fields = ("truck__identification", "title")
+
+
+@admin.register(CashEntry)
+class CashEntryAdmin(CompanyScopedAdmin):
+    list_display = ("due_date", "entry_type", "description", "amount", "status", "truck", "contract", "company")
+    list_filter = ("company", "entry_type", "status", "due_date")
+    search_fields = ("description", "category", "reference", "truck__identification", "contract__code")
 
 
 @admin.register(TireExpense)
