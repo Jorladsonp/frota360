@@ -4,10 +4,9 @@
     "cpus": 4
   },
   "waitFor": "onCreateCommand",
-  "updateContentCommand": "pip install -r requirements.txt && python manage.py migrate",
-  "postCreateCommand": "cp .env.example .env",
+  "updateContentCommand": "if [ ! -f .env ]; then cp .env.example .env; sed -i \"s/^SECRET_KEY=$/SECRET_KEY=$(openssl rand -hex 32)/\" .env; fi && python -m venv .venv && .venv/bin/python -m pip install --upgrade pip && .venv/bin/python -m pip install --upgrade -r requirements.txt && .venv/bin/python manage.py migrate && .venv/bin/python manage.py collectstatic --noinput",
   "postAttachCommand": {
-    "server": "python manage.py runserver 0.0.0.0:8000"
+    "server": "if ! curl --silent --fail http://127.0.0.1:8000/login/ > /dev/null; then setsid -f sh -c 'exec .venv/bin/python manage.py runserver 0.0.0.0:8000 > /tmp/frota360-django.log 2>&1'; fi"
   },
   "customizations": {
     "codespaces": {

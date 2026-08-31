@@ -16,10 +16,9 @@ Including another URLconf
 """
 
 from django.contrib import admin
-from django.urls import path, include, re_path
+from django.urls import include, path
 from django.conf import settings
 from django.conf.urls.static import static
-from django.contrib.staticfiles import views as static_views
 
 from fleet import views as fleet_views
 
@@ -75,11 +74,7 @@ urlpatterns = [
     path("relatorios/<slug:report_name>/", fleet_views.report_view, name="report_view"),
     path("relatorios/<slug:report_name>/csv/", fleet_views.report_csv, name="report_csv"),
     path("admin/", admin.site.urls),
-    path("__reload__/", include("django_browser_reload.urls")),
 ]
 if settings.DEBUG:
+    urlpatterns += [path("__reload__/", include("django_browser_reload.urls"))]
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-# The Codespaces starter environment may inject DEBUG=release. Keep local
-# development assets available while production deployments should use
-# collectstatic plus a proper static server.
-urlpatterns += [re_path(r"^static/(?P<path>.*)$", static_views.serve, {"insecure": True})]

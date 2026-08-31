@@ -39,7 +39,7 @@ O arquivo [`.vscode/settings.json`](.vscode/settings.json) já seleciona esse in
 
 ## GitHub Codespaces / Dev Container
 
-Ao abrir o repositório, aceite **Reabrir no Contêiner**. O Dev Container instala as dependências, executa as migrations, copia o `.env.example` e inicia a aplicação na porta `8000` quando o ambiente é conectado.
+Ao abrir o repositório, aceite **Reabrir no Contêiner**. O Dev Container atualiza as dependências, executa as migrations, coleta os arquivos estáticos e inicia a aplicação na porta `8000` quando o ambiente é conectado. Um `.env` existente nunca é sobrescrito.
 
 Se necessário, rode manualmente no terminal Linux:
 
@@ -54,6 +54,17 @@ python manage.py runserver 0.0.0.0:8000
 ```
 
 No Codespaces, abra a porta `8000` pela aba **Ports**.
+
+### Link público do Codespaces
+
+Com o servidor em execução, publique a porta atual e obtenha a URL:
+
+```bash
+gh codespace ports visibility 8000:public -c "$CODESPACE_NAME"
+gh codespace ports -c "$CODESPACE_NAME"
+```
+
+A URL tem o formato `https://<nome-do-codespace>-8000.app.github.dev`. O projeto já aceita esse domínio para `ALLOWED_HOSTS` e CSRF. A aplicação pública atual está disponível enquanto o Codespace estiver em execução; se ele for reiniciado, confirme novamente a visibilidade pública na aba **Ports** ou com o primeiro comando acima.
 
 ## Acesso de demonstração
 
@@ -118,6 +129,16 @@ node --check fleet\static\fleet\app.js
 
 ## Produção e limitações do MVP
 
-O protótipo usa SQLite. Para produção, configure PostgreSQL e revise `ALLOWED_HOSTS`, HTTPS, arquivos de mídia, backups, permissões e as credenciais de demonstração.
+O projeto inclui Gunicorn e WhiteNoise, portanto pode ser executado em um serviço web WSGI com:
+
+```bash
+python manage.py migrate
+python manage.py collectstatic --noinput
+DEBUG=False gunicorn hello_world.wsgi:application --bind 0.0.0.0:${PORT:-8000}
+```
+
+Em produção, defina uma `SECRET_KEY` exclusiva, `DEBUG=False`, os domínios reais em `ALLOWED_HOSTS` e as origens HTTPS em `CSRF_TRUSTED_ORIGINS`. A aplicação aceita `DATABASE_URL` no formato padrão de PostgreSQL, usado por Render, Railway e Heroku; se ela não for definida, continua usando SQLite. Para uso contínuo, use PostgreSQL, armazenamento persistente para mídia e backups, além de trocar as credenciais de demonstração.
+
+O [`Procfile`](Procfile) possui os processos `release` (migrations e arquivos estáticos) e `web` (Gunicorn). Em plataformas que não executam o processo `release`, use os dois primeiros comandos do exemplo acima como etapa de build/deploy.
 
 Não há GPS/telemetria, aplicativo nativo, integração com postos ou bancos, importação de Excel, manutenção preditiva ou controle avançado de pneus. A produção é lançada manualmente pelo gestor; entradas sem caminhão são rateadas por distância — ou por viagens quando não há distância no período.

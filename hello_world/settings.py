@@ -11,24 +11,43 @@ https://docs.djangoproject.com/en/5.0/topics/settings/
 """
 
 import os
+import sys
 from pathlib import Path
+
 from decouple import config
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+RUNNING_TESTS = "test" in sys.argv
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = config("SECRET_KEY", default="django-insecure-demo-only-change-me")
-
 # SECURITY WARNING: don't run with debug turned on in production!
+# Accept the values commonly injected by Codespaces and PaaS environments.
 DEBUG_VALUE = str(config("DEBUG", default="true")).strip().lower()
 DEBUG = DEBUG_VALUE in {"1", "true", "yes", "on", "development", "dev"}
 
-ALLOWED_HOSTS = [host.strip() for host in config('ALLOWED_HOSTS', default='*').split(',') if host.strip()]
+# A chave de desenvolvimento permite executar o projeto recém-clonado sem
+# expor uma credencial real. Em produção ela precisa ser fornecida pelo host.
+SECRET_KEY = config("SECRET_KEY", default="")
+if not SECRET_KEY and DEBUG:
+    SECRET_KEY = "django-insecure-local-development-only"
+if not DEBUG and (
+    len(SECRET_KEY) < 50 or SECRET_KEY.startswith(("change-this", "django-insecure-"))
+):
+    raise ImproperlyConfigured(
+        "Defina uma SECRET_KEY forte e exclusiva antes de iniciar em produção."
+    )
+
+configured_allowed_hosts = [
+    host.strip()
+    for host in config("ALLOWED_HOSTS", default="localhost,127.0.0.1").split(",")
+    if host.strip()
+]
+ALLOWED_HOSTS = configured_allowed_hosts.copy()
 
 # CSRF valida a origem do navegador separadamente de ALLOWED_HOSTS. O preview
 # local do Codespaces costuma usar https://localhost:8000, enquanto o preview
@@ -38,7 +57,28 @@ CSRF_TRUSTED_ORIGINS = ["https://localhost:8000", "http://localhost:8000", *conf
 codespace_name = os.environ.get("CODESPACE_NAME") or config("CODESPACE_NAME", default="")
 codespace_domain = os.environ.get("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN") or config("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN", default="")
 if codespace_name and codespace_domain:
-    CSRF_TRUSTED_ORIGINS.append(f"https://{codespace_name}-8000.{codespace_domain}")
+    codespace_host = f"{codespace_name}-8000.{codespace_domain}"
+    ALLOWED_HOSTS.append(codespace_host)
+    CSRF_TRUSTED_ORIGINS.append(f"https://{codespace_host}")
+
+ALLOWED_HOSTS = list(dict.fromkeys(ALLOWED_HOSTS))
+CSRF_TRUSTED_ORIGINS = list(dict.fromkeys(CSRF_TRUSTED_ORIGINS))
+if not DEBUG:
+    if "*" in ALLOWED_HOSTS:
+        raise ImproperlyConfigured("ALLOWED_HOSTS não pode usar '*' em produção.")
+    public_hosts = [
+        host for host in ALLOWED_HOSTS if host not in {"localhost", "127.0.0.1", "[::1]"}
+    ]
+    if not public_hosts:
+        raise ImproperlyConfigured("Defina ALLOWED_HOSTS com o domínio público da aplicação.")
+
+    # Um POST feito a partir de qualquer host público permitido deve passar
+    # pela validação CSRF. Valores explícitos continuam podendo adicionar
+    # origens externas, como um domínio separado do front-end.
+    for host in public_hosts:
+        origin_host = f"*{host}" if host.startswith(".") else host
+        CSRF_TRUSTED_ORIGINS.append(f"https://{origin_host}")
+    CSRF_TRUSTED_ORIGINS = list(dict.fromkeys(CSRF_TRUSTED_ORIGINS))
 
 # Application definition
 
@@ -49,22 +89,36 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "django_browser_reload",
     "fleet",
 ]
+if DEBUG:
+    INSTALLED_APPS.append("django_browser_reload")
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    "django_browser_reload.middleware.BrowserReloadMiddleware",
 ]
+if DEBUG:
+    MIDDLEWARE.append("django_browser_reload.middleware.BrowserReloadMiddleware")
 
-X_FRAME_OPTIONS = "ALLOW-FROM preview.app.github.dev"
+X_FRAME_OPTIONS = "DENY"
+
+if not DEBUG:
+    # Codespaces and most PaaS providers terminate TLS before reaching Gunicorn.
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SECURE_SSL_REDIRECT = False if RUNNING_TESTS else config("SECURE_SSL_REDIRECT", default=True, cast=bool)
+    SECURE_HSTS_SECONDS = config("SECURE_HSTS_SECONDS", default=31536000, cast=int)
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = config("SECURE_HSTS_INCLUDE_SUBDOMAINS", default=False, cast=bool)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = "same-origin"
 
 ROOT_URLCONF = "hello_world.urls"
 
@@ -90,20 +144,32 @@ WSGI_APPLICATION = "hello_world.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
-DB_ENGINE = config("DB_ENGINE", default="django.db.backends.sqlite3")
-if DB_ENGINE == "django.db.backends.sqlite3":
-    DATABASES = {"default": {"ENGINE": DB_ENGINE, "NAME": BASE_DIR / config("DB_NAME", default="db.sqlite3")}}
-else:
+DATABASE_URL = config("DATABASE_URL", default="")
+if DATABASE_URL:
+    import dj_database_url
+
     DATABASES = {
-        "default": {
-            "ENGINE": DB_ENGINE,
-            "NAME": config("DB_DATABASE", default="frota"),
-            "USER": config("DB_USERNAME", default=""),
-            "PASSWORD": config("DB_PASSWORD", default=""),
-            "HOST": config("DB_HOST", default="127.0.0.1"),
-            "PORT": config("DB_PORT", default="5432"),
-        }
+        "default": dj_database_url.parse(
+            DATABASE_URL,
+            conn_max_age=config("DB_CONN_MAX_AGE", default=600, cast=int),
+            conn_health_checks=True,
+        )
     }
+else:
+    DB_ENGINE = config("DB_ENGINE", default="django.db.backends.sqlite3")
+    if DB_ENGINE == "django.db.backends.sqlite3":
+        DATABASES = {"default": {"ENGINE": DB_ENGINE, "NAME": BASE_DIR / config("DB_NAME", default="db.sqlite3")}}
+    else:
+        DATABASES = {
+            "default": {
+                "ENGINE": DB_ENGINE,
+                "NAME": config("DB_DATABASE", default="frota"),
+                "USER": config("DB_USERNAME", default=""),
+                "PASSWORD": config("DB_PASSWORD", default=""),
+                "HOST": config("DB_HOST", default="127.0.0.1"),
+                "PORT": config("DB_PORT", default="5432"),
+            }
+        }
 
 
 # Password validation
@@ -144,8 +210,14 @@ STATICFILES_DIRS = [
     BASE_DIR / "hello_world" / "static",
 ]
 
-STATIC_URL = "static/"
-STATIC_ROOT = BASE_DIR / "hello_world" / "staticfiles"
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+staticfiles_backend = "django.contrib.staticfiles.storage.StaticFilesStorage" if DEBUG or RUNNING_TESTS else "whitenoise.storage.CompressedManifestStaticFilesStorage"
+STORAGES = {
+    "staticfiles": {
+        "BACKEND": staticfiles_backend,
+    },
+}
 
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "hello_world" / "media"
@@ -159,3 +231,8 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 LOGIN_URL = "login"
 LOGIN_REDIRECT_URL = "home"
 LOGOUT_REDIRECT_URL = "login"
+
+# Evita colisões com cookies da plataforma quando a aplicação é encaminhada
+# por um domínio compartilhado, como o app.github.dev do Codespaces.
+SESSION_COOKIE_NAME = "frota360_sessionid"
+CSRF_COOKIE_NAME = "frota360_csrftoken"
